@@ -72,7 +72,7 @@ def _generate_company_keywords(company_name: str) -> List[str]:
 
 
 # -------------------------
-# Company detection (FIXED)
+# Company detection (tuned for your dataset)
 # -------------------------
 
 def _extract_candidate_company_names(statement_json: dict, filename: str = "") -> List[str]:
@@ -181,7 +181,7 @@ def _pick_best_company_name(candidates: List[str]) -> str:
 
         # Length sanity
         ln = len(c)
-        if 8 <= ln <= 60:
+        if 8 <= ln <= 70:
             score += 5
         else:
             score -= 5
@@ -197,7 +197,6 @@ def _pick_best_company_name(candidates: List[str]) -> str:
         best = best.replace("SDN.", "SDN").strip()
         best = best + " BHD"
 
-    # Return as clean title-ish string (but keep internal upper usage elsewhere)
     return _sanitize_company_name(best)
 
 
@@ -235,22 +234,24 @@ def _patch_engine_config(
       - COMPANY_NAME
       - COMPANY_KEYWORDS
       - FILE_PATHS
-      - ACCOUNT_INFO
+      - ACCOUNT_INFO (MUST include account_holder for your engine)
       - RELATED_PARTIES (keep if exists)
     """
     company_name = _sanitize_company_name(company_name)
     company_keywords = _generate_company_keywords(company_name)
 
-    # Build FILE_PATHS and ACCOUNT_INFO placeholders now.
-    # FILE_PATHS will be overwritten with actual temp paths after writing temp files.
+    # FILE_PATHS placeholders now; will be overwritten with actual temp paths after write
     file_paths: Dict[str, str] = {}
     account_info: Dict[str, dict] = {}
 
     for fname, _payload, cfg in account_rows:
-        file_paths[cfg.account_id] = fname  # placeholder until temp files are written
+        file_paths[cfg.account_id] = fname  # placeholder
+
+        # IMPORTANT: engine expects info['account_holder']
         account_info[cfg.account_id] = {
             "account_number": cfg.account_number,
             "bank_name": cfg.bank_name,
+            "account_holder": company_name,  # <-- FIX for KeyError
             "account_type": cfg.account_type,
             "classification": cfg.classification,
             "description": f"{cfg.bank_name} ({cfg.classification})",
@@ -277,7 +278,6 @@ def _build_temp_files_and_update_paths(
 
 
 def _infer_bank_name(payload: dict) -> Optional[str]:
-    # Your statement JSONs may not include this; fallback to None
     for key in ["bank", "bank_name", "bankName", "institution", "institutionName"]:
         v = payload.get(key)
         if isinstance(v, str) and v.strip():
@@ -331,7 +331,6 @@ def main():
     for f in uploaded_files:
         payload = _safe_json_load(f)
         parsed.append((f.name, payload))
-        # IMPORTANT: include filename in candidate extraction (fix)
         candidate_names.extend(_extract_candidate_company_names(payload, filename=f.name))
 
     detected_company = _pick_best_company_name(candidate_names)
@@ -427,7 +426,7 @@ def main():
     except Exception as e:
         st.error("Core analysis failed.")
         st.exception(e)
-        st.info("Tip: verify the uploaded JSON schema matches what the engine expects.")
+        st.info("If it still fails, the issue is inside the engine (schema expectations).")
         return
 
     st.success("Analysis complete.")
