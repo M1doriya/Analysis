@@ -1,349 +1,171 @@
-import json
+import os
 import re
-import tempfile
-from dataclasses import dataclass
+import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from collections import Counter
-
 import streamlit as st
 
+# IMPORTANT: this must match your actual engine filename in the repo
+# If your engine file is bank_analysis_v5_2_1.py, keep this import exactly:
+import bank_analysis_v5_2_1 as engine
 
-# ------------------------------------------------------------
-# Robust engine import (fixes ModuleNotFoundError)
-# ------------------------------------------------------------
-def import_engine():
+
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_filename(name: str) -> str:
+    name = name.strip().replace("\\", "_").replace("/", "_")
+    name = re.sub(r"\s+", "_", name)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "", name)
+    return name or "uploaded.json"
+
+
+def _detect_bank_key(file_name: str, bank_name: str) -> str:
     """
-    Try importing the core engine from common filenames.
-    This prevents Streamlit Cloud ModuleNotFoundError when filenames differ.
+    Maps an uploaded statement JSON to the engine’s expected FILE_PATHS keys.
+    Adjust here if you add more banks/accounts.
     """
-    tried = []
+    fn = file_name.lower()
+    bn = (bank_name or "").lower()
 
-    for module_name in [
-        "bank_analysis_v5_2_1_fixed",  # if you created this
-        "bank_analysis_v5_2_1",        # your original upload name
-        "bank_analysis",               # common fallback
-    ]:
-        try:
-            mod = __import__(module_name)
-            return mod
-        except Exception as e:
-            tried.append((module_name, str(e)))
+    # CIMB (two accounts in your setup)
+    if "cimb" in bn:
+        # use filename hint for KL account
+        if "kl" in fn or "kuala" in fn or "main" in fn:
+            return "CIMB_KL"
+        return "CIMB"
 
-    # Helpful diagnostics: show repo files
-    repo_files = []
+    # Hong Leong
+    if "hong leong" in bn or "hlb" in fn or "hlib" in fn:
+        return "HLB"
+
+    # Muamalat
+    if "muamalat" in bn or "bmmb" in fn:
+        return "BMMB"
+
+    # fallback (still stored, but may not be used by engine if no matching key)
+    return "UNKNOWN"
+
+
+def _read_bank_name_from_statement_json(obj: dict) -> str:
+    """
+    Your statement JSON format includes bank name on each transaction row.
+    Example: "bank": "CIMB Islamic Bank" :contentReference[oaicite:2]{index=2}
+    """
     try:
-        repo_files = sorted([p.name for p in Path(".").glob("*.py")])
+        txns = obj.get("transactions", [])
+        if txns and isinstance(txns, list):
+            b = txns[0].get("bank")
+            if b:
+                return str(b)
     except Exception:
         pass
-
-    msg = (
-        "Could not import engine module.\n\n"
-        "Tried imports:\n"
-        + "\n".join([f"- {m}: {err}" for m, err in tried])
-        + "\n\n"
-        + "Python files found in repo root:\n"
-        + "\n".join([f"- {f}" for f in repo_files]) if repo_files else "\n(no .py files listed)"
-    )
-    raise ModuleNotFoundError(msg)
+    return ""
 
 
-# ------------------------------------------------------------
-# Data structures
-# ------------------------------------------------------------
-@dataclass
-class AccountConfig:
-    account_id: str
-    bank_name: str
-    account_number: str
-    account_type: str
-    classification: str
+st.set_page_config(page_title="Bank Statement Analysis", layout="wide")
+st.title("Bank Statement Analysis (Streamlit)")
 
-
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def safe_json_load(uploaded_file) -> dict:
-    try:
-        return json.loads(uploaded_file.getvalue().decode("utf-8"))
-    except Exception:
-        return json.loads(uploaded_file.getvalue())
-
-
-def write_temp_json(payload: dict, suffix: str = ".json") -> str:
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    p = Path(path)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    return str(p)
-
-
-def infer_bank_from_transactions(payload: dict) -> str:
-    txns = payload.get("transactions") or []
-    banks = []
-    if isinstance(txns, list):
-        for t in txns:
-            if isinstance(t, dict):
-                b = t.get("bank")
-                if isinstance(b, str) and b.strip():
-                    banks.append(b.strip())
-    if not banks:
-        return ""
-    return Counter(banks).most_common(1)[0][0]
-
-
-def validate_statement_json(payload: dict) -> Optional[str]:
-    if not isinstance(payload, dict):
-        return "Top-level JSON must be an object"
-    txns = payload.get("transactions")
-    if not isinstance(txns, list) or not txns:
-        return "JSON must contain a non-empty 'transactions' list"
-    needed = {"date", "description", "debit", "credit", "balance"}
-    for i, t in enumerate(txns[:5]):
-        if not isinstance(t, dict):
-            return f"transactions[{i}] is not an object"
-        missing = [k for k in needed if k not in t]
-        if missing:
-            return f"transactions[{i}] missing keys: {', '.join(missing)}"
-    return None
-
-
-def extract_candidate_company_names(statement_json: dict, filename: str = "") -> List[str]:
+st.markdown(
     """
-    Best-effort company candidates from narrations + filename.
-    Keeps it simple and safe; you can override manually in UI.
-    """
-    candidates: List[str] = []
-    fn = (filename or "").upper()
-    if "MTC" in fn:
-        candidates += ["MTC ENGINEERING SDN BHD", "MTC ENGINEERING"]
+Upload **multiple bank statement JSON outputs** (one per account/bank).
+Then set the **Company Name** explicitly (so it doesn’t get guessed from transaction text).
+"""
+)
 
-    txns = statement_json.get("transactions") or []
-    if not isinstance(txns, list):
-        return candidates
+company_name = st.text_input("Company name (required)", value="MTC ENGINEERING SDN BHD")
 
-    pat_legal = re.compile(
-        r"([A-Z][A-Z0-9&.\- ]{2,80}\b(?:SDN\.?\s*BHD\.?|SDN\.?|BERHAD|BHD)\b)"
-    )
+uploaded_files = st.file_uploader(
+    "Upload statement JSON files (multiple)",
+    type=["json"],
+    accept_multiple_files=True,
+)
 
-    for t in txns[:2500]:
-        if not isinstance(t, dict):
-            continue
-        desc = t.get("description")
-        if not isinstance(desc, str) or not desc.strip():
-            continue
-        u = desc.upper()
-        for m in pat_legal.finditer(u):
-            candidates.append(m.group(1).strip())
-
-    return candidates
+run_btn = st.button("Run analysis")
 
 
-def pick_best_company_name(candidates: List[str]) -> str:
-    if not candidates:
-        return ""
-    norm = []
-    for c in candidates:
-        c = re.sub(r"\s+", " ", str(c).strip()).upper()
-        if c:
-            norm.append(c)
-    freq = Counter(norm)
-    # prefer those containing SDN/BHD and MTC
-    def score(name: str) -> Tuple[int, int, int]:
-        return (
-            (1 if "MTC" in name else 0),
-            (1 if ("SDN" in name or "BHD" in name or "BERHAD" in name) else 0),
-            len(name),
-        )
-    best = sorted(freq.keys(), key=lambda n: (freq[n],) + score(n), reverse=True)[0]
-    return best.title()
-
-
-# ------------------------------------------------------------
-# Streamlit App
-# ------------------------------------------------------------
-def main():
-    st.set_page_config(page_title="Bank Analysis", layout="wide")
-    st.title("Bank Analysis (Multi-Statement Upload)")
-
-    # import engine with robust fallback
-    try:
-        engine = import_engine()
-    except Exception as e:
-        st.error("Failed to import analysis engine module.")
-        st.code(str(e))
+if run_btn:
+    if not company_name.strip():
+        st.error("Company name is required. Please fill it in.")
         st.stop()
-
-    st.caption(
-        "Upload multiple JSON statements. This app wires them into the core engine, "
-        "ensuring required fields (like account_holder) exist to avoid runtime errors."
-    )
-
-    uploaded_files = st.file_uploader(
-        "Upload one or more JSON statement files",
-        type=["json"],
-        accept_multiple_files=True,
-    )
 
     if not uploaded_files:
-        st.info("Upload at least one statement JSON file to continue.")
-        return
+        st.error("Please upload at least one statement JSON.")
+        st.stop()
 
-    parsed: List[Tuple[str, dict]] = []
-    errors: List[str] = []
-    candidates: List[str] = []
-
+    # 1) Save uploads + detect bank_name + map to keys
+    detected = []
     for f in uploaded_files:
+        raw = f.read()
         try:
-            payload = safe_json_load(f)
-        except Exception as e:
-            errors.append(f"{f.name}: JSON parse failed ({e})")
-            continue
-
-        err = validate_statement_json(payload)
-        if err:
-            errors.append(f"{f.name}: {err}")
-            continue
-
-        parsed.append((f.name, payload))
-        candidates.extend(extract_candidate_company_names(payload, filename=f.name))
-
-    if errors:
-        st.error("Some files could not be used:")
-        for e in errors:
-            st.write(f"- {e}")
-        if not parsed:
+            obj = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            st.error(f"Invalid JSON: {f.name}")
             st.stop()
 
-    detected_company = pick_best_company_name(candidates)
-    company_name = st.text_input(
-        "Company name (edit to ensure correct)",
-        value=detected_company or "",
-    )
-    if not company_name.strip():
-        st.warning("Please enter the company name.")
-        st.stop()
+        bank_name = _read_bank_name_from_statement_json(obj)
+        bank_key = _detect_bank_key(f.name, bank_name)
 
-    st.subheader("Account setup (one per uploaded statement)")
-    st.caption("Bank name defaults to the most common `transactions[].bank` in each file.")
+        out_name = _safe_filename(f.name)
+        out_path = UPLOAD_DIR / out_name
+        out_path.write_bytes(raw)
 
-    account_rows: List[Tuple[str, dict, AccountConfig]] = []
+        detected.append((f.name, bank_key, bank_name, str(out_path)))
 
-    used_ids = set()
-    for idx, (fname, payload) in enumerate(parsed, start=1):
-        inferred_bank = infer_bank_from_transactions(payload)
-        default_acc_id = f"acc_{idx}"
-        if default_acc_id in used_ids:
-            default_acc_id = f"acc_{idx}_{len(used_ids)+1}"
-        used_ids.add(default_acc_id)
-
-        with st.container(border=True):
-            st.markdown(f"**File:** `{fname}`")
-            c1, c2, c3 = st.columns(3)
-
-            with c1:
-                account_id = st.text_input(
-                    f"Account ID ({fname})",
-                    value=default_acc_id,
-                    key=f"accid_{idx}",
-                )
-                bank_name = st.text_input(
-                    f"Bank Name ({fname})",
-                    value=inferred_bank or "",
-                    key=f"bank_{idx}",
-                )
-
-            with c2:
-                account_number = st.text_input(
-                    f"Account Number ({fname})",
-                    value="",
-                    key=f"accno_{idx}",
-                )
-                account_type = st.selectbox(
-                    f"Account Type ({fname})",
-                    options=["Current", "Savings", "Other"],
-                    index=0,
-                    key=f"acctype_{idx}",
-                )
-
-            with c3:
-                classification = st.selectbox(
-                    f"Classification ({fname})",
-                    options=["PRIMARY", "SECONDARY", "OTHER"],
-                    index=0,
-                    key=f"class_{idx}",
-                )
-
-            cfg = AccountConfig(
-                account_id=(account_id.strip() or default_acc_id),
-                bank_name=(bank_name.strip() or inferred_bank or "(Unknown bank)"),
-                account_number=(account_number.strip() or "(Not provided)"),
-                account_type=account_type,
-                classification=classification,
-            )
-            account_rows.append((fname, payload, cfg))
-
-    st.subheader("Run analysis")
-    if not st.button("Run", type="primary"):
-        return
-
-    # Patch engine globals safely (no logic change)
-    try:
-        engine.COMPANY_NAME = company_name.strip()
-
-        # Some engines expect COMPANY_KEYWORDS
-        if hasattr(engine, "COMPANY_KEYWORDS"):
-            # keep whatever format engine expects; use a safe minimal set
-            engine.COMPANY_KEYWORDS = [company_name.strip().upper()]
-
-        file_paths: Dict[str, str] = {}
-        account_info: Dict[str, dict] = {}
-
-        for _fname, payload, cfg in account_rows:
-            temp_path = write_temp_json(payload, suffix=f"_{cfg.account_id}.json")
-            file_paths[cfg.account_id] = temp_path
-
-            # IMPORTANT: include account_holder to avoid KeyError
-            account_info[cfg.account_id] = {
-                "bank_name": cfg.bank_name,
-                "account_number": cfg.account_number,
-                "account_holder": company_name.strip(),
-                "account_type": cfg.account_type,
-                "classification": cfg.classification,
-                "description": f"{cfg.bank_name} ({cfg.classification})",
+    # Show what we mapped
+    st.subheader("Detected uploads")
+    st.write(
+        [
+            {
+                "filename": fn,
+                "mapped_key": key,
+                "detected_bank_name": bn,
+                "saved_path": p,
             }
+            for (fn, key, bn, p) in detected
+        ]
+    )
 
-        engine.FILE_PATHS = file_paths
-        engine.ACCOUNT_INFO = account_info
+    # 2) Override engine globals (keeps core logic intact)
+    engine.COMPANY_NAME = company_name.strip()
 
-        # Some engines use RELATED_PARTIES and may not have it set
-        if not hasattr(engine, "RELATED_PARTIES") or engine.RELATED_PARTIES is None:
-            engine.RELATED_PARTIES = {}
+    # Ensure account_holder uses the overridden company name
+    for k, info in engine.ACCOUNT_INFO.items():
+        if isinstance(info, dict):
+            info["account_holder"] = engine.COMPANY_NAME
 
-    except Exception as e:
-        st.error("Failed to configure engine globals.")
-        st.exception(e)
-        st.stop()
+    # 3) Update FILE_PATHS based on uploads
+    # Only set keys we recognize (CIMB_KL, CIMB, HLB, BMMB)
+    for (fn, key, bn, p) in detected:
+        if key in engine.FILE_PATHS:
+            engine.FILE_PATHS[key] = p
 
-    # Run core analysis
+            # Update bank_name in ACCOUNT_INFO if detected (helps report metadata)
+            if bn and key in engine.ACCOUNT_INFO:
+                engine.ACCOUNT_INFO[key]["bank_name"] = bn
+
+    # 4) Run engine
     try:
-        results = engine.analyze()
+        result = engine.analyze()
     except Exception as e:
         st.error("Core analysis failed.")
         st.exception(e)
         st.stop()
 
+    # 5) Output
     st.success("Analysis completed.")
-    st.subheader("Output JSON")
-    st.json(results)
+    st.subheader("Report info")
+    st.json(result.get("report_info", {}))
 
+    st.subheader("Full JSON")
+    st.json(result)
+
+    # Save result to file for download
+    output_path = UPLOAD_DIR / "results.json"
+    output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     st.download_button(
         "Download results.json",
-        data=json.dumps(results, ensure_ascii=False, indent=2).encode("utf-8"),
+        data=output_path.read_bytes(),
         file_name="results.json",
         mime="application/json",
     )
-
-
-if __name__ == "__main__":
-    main()
