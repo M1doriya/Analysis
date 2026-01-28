@@ -39,7 +39,11 @@ def _generate_company_keywords(company_name: str) -> List[str]:
         return []
 
     # Remove common suffix noise for keyword generation
-    cleaned = re.sub(r"\b(SDN\.?|BHD\.?|BERHAD|SENDIRIAN|LIMITED|LTD\.?|CO\.?|COMPANY)\b", "", name)
+    cleaned = re.sub(
+        r"\b(SDN\.?|BHD\.?|BERHAD|SENDIRIAN|LIMITED|LTD\.?|CO\.?|COMPANY)\b",
+        "",
+        name,
+    )
     cleaned = re.sub(r"[^A-Z0-9& ]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     words = [w for w in cleaned.split() if len(w) > 2]
@@ -69,254 +73,337 @@ def _generate_company_keywords(company_name: str) -> List[str]:
 
 
 def _extract_candidate_company_names(statement_json: dict) -> List[str]:
-    """Heuristic: extract company-like names from descriptions/account fields."""
-    cands: List[str] = []
+    """Heuristic: mine plausible company names from statement fields."""
+    candidates: List[str] = []
 
-    # Some generators include these keys; we handle if present.
-    for k in ["account_holder", "account_name", "company_name"]:
-        v = statement_json.get(k)
+    # Common places a statement might store account holder / company name
+    for key in [
+        "account_holder",
+        "accountHolder",
+        "company_name",
+        "companyName",
+        "customer_name",
+        "customerName",
+        "name",
+    ]:
+        v = statement_json.get(key)
         if isinstance(v, str) and v.strip():
-            cands.append(v.strip())
+            candidates.append(v.strip())
 
-    txns = statement_json.get("transactions")
+    # Sometimes nested in account details
+    acct = statement_json.get("account") or statement_json.get("accountDetails") or {}
+    if isinstance(acct, dict):
+        for key in ["holder", "account_holder", "accountHolder", "name", "customerName"]:
+            v = acct.get(key)
+            if isinstance(v, str) and v.strip():
+                candidates.append(v.strip())
+
+    # Look into transactions for payee/description patterns like "... SDN BHD"
+    txns = statement_json.get("transactions") or statement_json.get("transactionDetails") or []
     if isinstance(txns, list):
-        # Match patterns like "... MTC ENGINEERING SDN BHD" or "... SDN. BHD"
-        # Keep it conservative to reduce garbage.
-        patt = re.compile(
-            r"\b([A-Z0-9&.,/\- ]{3,}?(?:SDN\.?\s*BHD\.?|BERHAD|BHD\.?))\b",
-            re.IGNORECASE,
-        )
-        for t in txns[:2000]:  # cap for performance
-            d = t.get("description") if isinstance(t, dict) else None
-            if not isinstance(d, str):
+        for t in txns[:2000]:
+            if not isinstance(t, dict):
                 continue
-            m = patt.search(d.upper())
-            if m:
-                cands.append(m.group(1).strip())
-    return cands
+            for k in ["description", "details", "merchant", "payee", "narration", "remarks"]:
+                v = t.get(k)
+                if not isinstance(v, str):
+                    continue
+                # Match typical MY company formats
+                m = re.search(
+                    r"([A-Z][A-Z0-9&.\- ]{3,80}\b(?:SDN\.?\s*BHD|BERHAD|BHD)\b)",
+                    v.upper(),
+                )
+                if m:
+                    candidates.append(m.group(1).strip())
+    return candidates
 
 
-def _detect_company_name(uploaded_jsons: List[dict]) -> Optional[str]:
-    """Pick most frequent candidate; returns None if not enough signal."""
-    freq: Dict[str, int] = {}
-    for j in uploaded_jsons:
-        for c in _extract_candidate_company_names(j):
-            c = _sanitize_company_name(c).upper()
-            if not c:
-                continue
-            # Normalize punctuation spacing
-            c = c.replace("SDN. BHD", "SDN BHD").replace("SDN.BHD", "SDN BHD")
-            c = re.sub(r"\s+", " ", c).strip()
-            freq[c] = freq.get(c, 0) + 1
-    if not freq:
-        return None
-    # Prefer the longest among equally frequent to avoid truncated matches
-    best = sorted(freq.items(), key=lambda kv: (kv[1], len(kv[0])), reverse=True)[0][0]
-    return best
+def _pick_best_company_name(candidates: List[str]) -> str:
+    """Choose the most plausible company name from extracted candidates."""
+    if not candidates:
+        return ""
+
+    # Prefer names with SDN BHD/BERHAD/BHD markers
+    scored: List[Tuple[int, str]] = []
+    for c in candidates:
+        uc = c.upper()
+        score = 0
+        if re.search(r"\bSDN\.?\s*BHD\b", uc):
+            score += 50
+        if re.search(r"\bBERHAD\b", uc):
+            score += 40
+        if re.search(r"\bBHD\b", uc):
+            score += 30
+        # Penalize very short/very long
+        ln = len(c.strip())
+        if 10 <= ln <= 60:
+            score += 10
+        else:
+            score -= 10
+        # Favor more "company-like" (multiple words)
+        if len(c.strip().split()) >= 2:
+            score += 5
+        scored.append((score, c))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return _sanitize_company_name(scored[0][1])
 
 
-def _default_account_id_from_filename(name: str, idx: int) -> str:
-    stem = Path(name).stem.upper()
-    # common mappings users use (you can extend this)
-    for key in ["CIMB_KL", "CIMBKL", "CIMB", "HLB", "BMMB", "MUAMALAT"]:
-        if key.replace("_", "") in stem.replace("_", ""):
-            return "CIMB_KL" if key in {"CIMB_KL", "CIMBKL"} else key
-    return f"ACC_{idx+1}"
+def _safe_json_load(uploaded_file) -> dict:
+    try:
+        return json.loads(uploaded_file.getvalue().decode("utf-8"))
+    except Exception:
+        # fallback attempt if file already decoded differently
+        return json.loads(uploaded_file.getvalue())
 
 
-def main() -> None:
-    st.set_page_config(page_title="Bank Statement Analysis", layout="wide")
-    st.title("Bank Statement Analysis Engine (Streamlit)")
+def _write_temp_json(payload: dict, suffix: str = ".json") -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    p = Path(path)
+    with p.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return str(p)
 
-    st.info(
-        "Upload one or more statement JSON files (the input format described in README). "
-        "The app will run the deterministic analysis and let you download the output JSON."
-    )
 
-    uploads = st.file_uploader(
-        "Bank statement JSON files",
+def _import_engine():
+    """
+    Import core analysis engine.
+
+    Keep bank_analysis_v5_2_1.py unchanged; we only patch its global config values.
+    """
+    import importlib
+
+    return importlib.import_module("bank_analysis_v5_2_1")
+
+
+def _patch_engine_config(
+    engine,
+    company_name: str,
+    account_rows: List[Tuple[str, dict, AccountConfig]],
+) -> None:
+    """
+    Patch engine globals minimally:
+      - COMPANY_NAME
+      - COMPANY_KEYWORDS
+      - FILE_PATHS
+      - ACCOUNT_INFO
+      - RELATED_PARTIES (optional; keep existing if present)
+    """
+    company_name = _sanitize_company_name(company_name)
+    company_keywords = _generate_company_keywords(company_name)
+
+    # FILE_PATHS in the engine is used by load_data(). We map to our temp files.
+    file_paths: Dict[str, str] = {}
+    account_info: Dict[str, dict] = {}
+
+    for fname, _payload, cfg in account_rows:
+        # We write temp file per account and map it
+        # Note: fname already corresponds to uploaded filename; unique-enough for UI.
+        # We'll use account_id as primary key for engine mapping.
+        file_paths[cfg.account_id] = fname
+        account_info[cfg.account_id] = {
+            "account_number": cfg.account_number,
+            "bank_name": cfg.bank_name,
+            "account_type": cfg.account_type,
+            "classification": cfg.classification,
+            "description": f"{cfg.bank_name} ({cfg.classification})",
+        }
+
+    # Patch
+    engine.COMPANY_NAME = company_name
+    engine.COMPANY_KEYWORDS = company_keywords
+
+    # The engine expects FILE_PATHS to be account_id -> path on disk
+    # Our fname values in file_paths currently store uploaded filenames; we will overwrite
+    # them after writing temp files in the calling scope.
+    engine.FILE_PATHS = file_paths
+    engine.ACCOUNT_INFO = account_info
+
+    # RELATED_PARTIES: keep existing if present, otherwise set empty dict
+    if not hasattr(engine, "RELATED_PARTIES") or engine.RELATED_PARTIES is None:
+        engine.RELATED_PARTIES = {}
+
+
+def _build_temp_files_and_update_paths(
+    engine,
+    account_rows: List[Tuple[str, dict, AccountConfig]],
+) -> None:
+    """
+    Write each uploaded JSON to a temp file and update engine.FILE_PATHS accordingly.
+    """
+    new_paths: Dict[str, str] = {}
+    for _fname, payload, cfg in account_rows:
+        temp_path = _write_temp_json(payload, suffix=f"_{cfg.account_id}.json")
+        new_paths[cfg.account_id] = temp_path
+    engine.FILE_PATHS = new_paths
+
+
+def main():
+    st.set_page_config(page_title="Bank Analysis (Streamlit)", layout="wide")
+    st.title("Bank Analysis")
+    st.caption("Upload bank statement JSON files, set company name, and run analysis.")
+
+    st.subheader("1) Upload statement JSON files")
+    uploaded_files = st.file_uploader(
+        "Upload one or more JSON statement files",
         type=["json"],
         accept_multiple_files=True,
     )
 
-    if not uploads:
-        st.stop()
+    if not uploaded_files:
+        st.info("Upload at least one statement JSON file to continue.")
+        return
 
-    uploaded_jsons: List[dict] = []
-    uploaded_names: List[str] = []
-    for f in uploads:
-        try:
-            uploaded_jsons.append(json.load(f))
-            uploaded_names.append(f.name)
-        except Exception as e:
-            st.error(f"Failed to read {f.name} as JSON: {e}")
-            st.stop()
+    # Parse uploads
+    parsed: List[Tuple[str, dict]] = []
+    candidate_names: List[str] = []
+    for f in uploaded_files:
+        payload = _safe_json_load(f)
+        parsed.append((f.name, payload))
+        candidate_names.extend(_extract_candidate_company_names(payload))
 
-    # Company name detection + override
-    detected = _detect_company_name(uploaded_jsons)
-    st.subheader("Company identification")
+    detected_company = _pick_best_company_name(candidate_names)
+
+    st.subheader("2) Company name (accuracy critical)")
     company_name = st.text_input(
-        "Company name (auto-detected; edit if wrong)",
-        value=_sanitize_company_name(detected or ""),
-        help="Used for report metadata and for inter-account marker matching.",
-    )
-    company_name = _sanitize_company_name(company_name)
-
-    company_keywords = _generate_company_keywords(company_name) if company_name else []
-    st.caption("Company keywords used for partial matching (auto-generated)")
-    st.code("\n".join(company_keywords) if company_keywords else "(no keywords)")
-
-    st.subheader("Accounts mapping")
-    st.write(
-        "Map each uploaded file to an account id and metadata. "
-        "Account IDs must be unique (e.g., CIMB_KL, CIMB, HLB, BMMB)."
+        "Company name (edit to ensure it is correct)",
+        value=detected_company or "",
+        help="We will generate robust COMPANY_KEYWORDS from this to improve detection.",
     )
 
-    default_bank_names = {
-        "CIMB": "CIMB Islamic Bank",
-        "CIMB_KL": "CIMB Islamic Bank",
-        "HLB": "Hong Leong Islamic Bank",
-        "BMMB": "Bank Muamalat Malaysia",
-        "MUAMALAT": "Bank Muamalat Malaysia",
-    }
+    if not company_name.strip():
+        st.warning("Please enter the company name to avoid mis-detection.")
+        return
 
+    with st.expander("Show generated company keywords"):
+        st.code("\n".join(_generate_company_keywords(company_name)), language="text")
+
+    st.subheader("3) Account metadata (per uploaded file)")
+    st.caption("These feed the engine's ACCOUNT_INFO. Keep accurate to avoid mislabeling.")
+
+    # Defaults
     account_rows: List[Tuple[str, dict, AccountConfig]] = []
+    for idx, (fname, payload) in enumerate(parsed, start=1):
+        with st.container(border=True):
+            st.markdown(f"**File:** `{fname}`")
 
-    for i, (fname, payload) in enumerate(zip(uploaded_names, uploaded_jsons)):
-        with st.expander(f"{fname}", expanded=(i == 0)):
-            acc_id_default = _default_account_id_from_filename(fname, i)
-            acc_id = st.text_input(
-                "Account ID",
-                value=acc_id_default,
-                key=f"acc_id_{i}",
-            ).strip().upper()
-
-            bank_name = st.text_input(
-                "Bank name",
-                value=default_bank_names.get(acc_id, ""),
-                key=f"bank_name_{i}",
-            ).strip()
-
-            account_number = st.text_input(
-                "Account number (optional)",
-                value="",
-                key=f"acc_no_{i}",
-            ).strip()
-
-            account_type = st.selectbox(
-                "Account type",
-                options=["Current", "Savings", "OD"],
-                index=0,
-                key=f"acc_type_{i}",
-            )
-
-            classification = st.selectbox(
-                "Classification",
-                options=["PRIMARY", "SECONDARY", "ESCROW", "PROJECT"],
-                index=0,
-                key=f"acc_class_{i}",
-            )
-
-            account_rows.append(
-                (
-                    fname,
-                    payload,
-                    AccountConfig(
-                        account_id=acc_id,
-                        bank_name=bank_name or "(Unknown bank)",
-                        account_number=account_number or "(Not provided)",
-                        account_type=account_type,
-                        classification=classification,
-                    ),
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                account_id = st.text_input(
+                    f"Account ID ({fname})",
+                    value=f"acc_{idx}",
+                    key=f"accid_{idx}",
+                )
+                bank_name = st.text_input(
+                    f"Bank name ({fname})",
+                    value=_infer_bank_name(payload) or "",
+                    key=f"bank_{idx}",
+                )
+            with col2:
+                account_number = st.text_input(
+                    f"Account number ({fname})",
+                    value=_infer_account_number(payload) or "",
+                    key=f"accno_{idx}",
+                )
+                account_type = st.selectbox(
+                    f"Account type ({fname})",
+                    options=["checking", "savings", "credit", "other"],
+                    index=0,
+                    key=f"acctyp_{idx}",
+                )
+            with col3:
+                classification = st.selectbox(
+                    f"Classification ({fname})",
+                    options=["operational", "cash_account", "inter_account", "credit_facility", "other"],
+                    index=0,
+                    key=f"class_{idx}",
+                    help="Match your engine's expected classifications. Defaults provided.",
                 )
 
-    # Validate unique account IDs
-    ids = [r[2].account_id for r in account_rows]
-    if len(ids) != len(set(ids)):
-        st.error("Account IDs must be unique. Please fix duplicates above.")
-        st.stop()
+            cfg = AccountConfig(
+                account_id=account_id.strip() or f"acc_{idx}",
+                bank_name=bank_name.strip() or "(Unknown bank)",
+                account_number=account_number.strip() or "(Not provided)",
+                account_type=account_type,
+                classification=classification,
+            )
 
-    st.subheader("Related parties")
-    st.write("Optional: add related parties (one per line). Use format: NAME | Relationship")
-    rp_text = st.text_area(
-        "Related parties",
-        value="",
-        placeholder="MTC FLOATING SOLUTIONS SDN BHD | Sister Company\nDIRECTOR NAME | Director",
-    )
+            account_rows.append((fname, payload, cfg))
 
-    related_parties = []
-    for line in rp_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if "|" in line:
-            name, rel = [x.strip() for x in line.split("|", 1)]
-        else:
-            name, rel = line, "Related Party"
-        if name:
-            related_parties.append({"name": name, "relationship": rel or "Related Party"})
+    st.subheader("4) Run analysis")
+    run = st.button("Run", type="primary")
 
-    run = st.button("Run analysis")
     if not run:
-        st.stop()
+        return
 
-    if not company_name:
-        st.error("Please provide a company name (auto-detect may be blank).")
-        st.stop()
-
-    # Write uploads to temp files, then patch globals in the core module.
     try:
-        import bank_analysis_v5_2_1 as core
+        engine = _import_engine()
     except Exception as e:
-        st.error(
-            "Could not import bank_analysis_v5_2_1.py. "
-            "Ensure it is in the same repository folder as app.py.\n\n"
-            f"Import error: {e}"
-        )
-        st.stop()
+        st.error("Failed to import core engine. Ensure bank_analysis_v5_2_1.py is in the repo root.")
+        st.exception(e)
+        return
 
-    tmpdir = tempfile.TemporaryDirectory()
-    tmp_path = Path(tmpdir.name)
-    file_paths: Dict[str, str] = {}
-    account_info: Dict[str, dict] = {}
+    # Patch configuration globals, then write temp files and update FILE_PATHS
+    try:
+        _patch_engine_config(engine, company_name, account_rows)
+        _build_temp_files_and_update_paths(engine, account_rows)
+    except Exception as e:
+        st.error("Failed to configure engine.")
+        st.exception(e)
+        return
 
-    for fname, payload, cfg in account_rows:
-        out_path = tmp_path / f"{cfg.account_id}.json"
-        out_path.write_text(json.dumps(payload, ensure_ascii=False))
-        file_paths[cfg.account_id] = str(out_path)
-        account_info[cfg.account_id] = {
-            "bank_name": cfg.bank_name,
-            "account_number": cfg.account_number,
-            "account_holder": company_name,
-            "account_type": cfg.account_type,
-            "classification": cfg.classification,
-        }
+    # Run analysis (core logic)
+    try:
+        results = engine.analyze()
+    except Exception as e:
+        st.error("Core analysis failed.")
+        st.exception(e)
+        st.info("Tip: check that your uploaded JSON schema matches what the engine expects.")
+        return
 
-    # Patch configuration (no change to core logic)
-    core.COMPANY_NAME = company_name
-    core.COMPANY_KEYWORDS = company_keywords
-    core.RELATED_PARTIES = related_parties
-    core.FILE_PATHS = file_paths
-    core.ACCOUNT_INFO = account_info
+    st.success("Analysis complete.")
 
-    with st.spinner("Analyzing..."):
-        try:
-            result = core.analyze()
-        except Exception as e:
-            st.error(f"Analysis failed: {e}")
-            st.stop()
+    st.subheader("Results")
+    st.json(results)
 
-    st.success("Analysis completed")
-    st.subheader("Output")
-    st.json(result, expanded=False)
-
-    out_bytes = json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8")
+    # Download
+    st.subheader("Download output")
+    out_str = json.dumps(results, ensure_ascii=False, indent=2)
     st.download_button(
-        "Download output JSON",
-        data=out_bytes,
-        file_name=f"{company_name.replace(' ', '_')}_analysis.json",
+        "Download results.json",
+        data=out_str.encode("utf-8"),
+        file_name="results.json",
         mime="application/json",
     )
+
+
+def _infer_bank_name(payload: dict) -> Optional[str]:
+    # Optional heuristics from statement metadata
+    for key in ["bank", "bank_name", "bankName", "institution", "institutionName"]:
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    acct = payload.get("account") or {}
+    if isinstance(acct, dict):
+        for key in ["bank", "bank_name", "bankName", "institution", "institutionName"]:
+            v = acct.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def _infer_account_number(payload: dict) -> Optional[str]:
+    for key in ["account_number", "accountNumber", "acct_no", "acctNo", "number"]:
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    acct = payload.get("account") or {}
+    if isinstance(acct, dict):
+        for key in ["account_number", "accountNumber", "acct_no", "acctNo", "number"]:
+            v = acct.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
 
 
 if __name__ == "__main__":
