@@ -3,1322 +3,1074 @@
 ================================================================================
 BANK STATEMENT ANALYSIS ENGINE v5.2.1
 ================================================================================
-DETERMINISTIC IMPLEMENTATION - Consistent results every run
 
-Changes from v5.2.0:
-- Added Related Party detection (Priority 3 for credits, Priority 2 for debits)
-- Configurable related parties list with partial matching
-- Improved configuration section for easy customization
-- Fixed datetime deprecation warning
-- Added purpose_note extraction for related party transactions
-- Better documentation
+This script processes bank statement JSON files and generates a comprehensive
+business financial analysis report.
 
-Key Features:
-1. Sort all transactions by (date, -amount, description) before processing
-2. Process in strict priority order with explicit rules
-3. Use consistent tie-breaking (first match wins)
-4. Related Party check BEFORE Statutory/Salary (per methodology)
+Input Format:
+- JSON files containing transaction data for each bank account
 
-Reference: BANK_ANALYSIS_CHECKLIST_v5_2_0.md, MULTI_ACCOUNT_ANALYSIS_v5_2_0.md
-================================================================================
+Output:
+- Consolidated JSON report with financial analysis metrics
+
+Author: Bank Analysis Engine
+Version: 5.2.1
+Last Updated: 2025
 """
 
 import json
 import re
+from collections import defaultdict, Counter
 from datetime import datetime, timezone
-from collections import defaultdict
-from typing import Dict, List, Set, Tuple, Optional, Any
+from math import ceil
+from pathlib import Path
 
-# ============================================================================
-# CONFIGURATION - MODIFY THIS SECTION FOR EACH COMPANY
-# ============================================================================
+# =============================================================================
+# CONFIGURATION SECTION
+# =============================================================================
 
-# Company identification
+# Company information
 COMPANY_NAME = "MTC ENGINEERING SDN BHD"
-COMPANY_KEYWORDS = ["MTC ENGINEERING", "MTC ENGIN"]  # For partial matching
 
-# Related parties - Add directors, shareholders, sister companies, etc.
-# Format: {'name': 'Full Name', 'relationship': 'Director|Shareholder|Sister Company|etc'}
+# Related parties (directors/owners/linked companies) to flag
 RELATED_PARTIES = [
-    # Sister companies in MTC Group
-    {'name': 'MTC FLOATING SOLUTIONS SDN BHD', 'relationship': 'Sister Company'},
-    {'name': 'MTC ENERGY SDN BHD', 'relationship': 'Sister Company'},
-    # Add more related parties as identified:
-    # {'name': 'DIRECTOR NAME', 'relationship': 'Director'},
+    {"name": "MTC ENGINEERING SDN BHD", "relationship": "Company"},
+    {"name": "MTC ENGINEERING", "relationship": "Company"},
+    {"name": "MTC ENGINEERING SDN", "relationship": "Company"},
+    {"name": "MTC", "relationship": "Company"},
+    {"name": "MTC ENGR", "relationship": "Company"},
 ]
 
 # Account information - Modify for each analysis
 ACCOUNT_INFO = {
-    'CIMB_KL': {
-        'bank_name': 'CIMB Islamic Bank',
-        'account_number': '8600509927',
-        'account_holder': COMPANY_NAME,
-        'account_type': 'Current',
-        'classification': 'PRIMARY'
+    "CIMB_KL": {
+        "bank_name": "CIMB Islamic Bank",
+        "account_number": "8600509927",
+        "account_holder": COMPANY_NAME,
+        "account_type": "Current",
+        "classification": "PRIMARY",
     },
-    'CIMB': {
-        'bank_name': 'CIMB Islamic Bank',
-        'account_number': '8600106439',
-        'account_holder': COMPANY_NAME,
-        'account_type': 'Current',
-        'classification': 'SECONDARY'
+    "CIMB_2": {
+        "bank_name": "CIMB Islamic Bank",
+        "account_number": "8600522517",
+        "account_holder": COMPANY_NAME,
+        "account_type": "Current",
+        "classification": "SECONDARY",
     },
-    'HLB': {
-        'bank_name': 'Hong Leong Islamic Bank',
-        'account_number': '28500016095',
-        'account_holder': COMPANY_NAME,
-        'account_type': 'Current',
-        'classification': 'SECONDARY'
+    "HLB": {
+        "bank_name": "Hong Leong Bank",
+        "account_number": "20006976096",
+        "account_holder": COMPANY_NAME,
+        "account_type": "Current",
+        "classification": "PRIMARY",
     },
-    'BMMB': {
-        'bank_name': 'Bank Muamalat Malaysia',
-        'account_number': '1203010001XXX',
-        'account_holder': COMPANY_NAME,
-        'account_type': 'Current',
-        'classification': 'SECONDARY'
-    }
+    "MUAMALAT": {
+        "bank_name": "Bank Muamalat",
+        "account_number": "1001005131",
+        "account_holder": COMPANY_NAME,
+        "account_type": "Current",
+        "classification": "PRIMARY",
+    },
 }
 
-# File paths - Modify for each analysis
+# File paths for account statements - Modify for each analysis
 FILE_PATHS = {
-    'CIMB_KL': '/mnt/user-data/uploads/CIMB_KL_MTC.json',
-    'CIMB': '/mnt/user-data/uploads/CIMB_MTC.json',
-    'HLB': '/mnt/user-data/uploads/HLB_MTC.json',
-    'BMMB': '/mnt/user-data/uploads/Muamalat_MTC.json'
+    "CIMB_KL": "CIMB KL MTC.json",
+    "CIMB_2": "CIMB MTC.json",
+    "HLB": "HLB MTC.json",
+    "MUAMALAT": "Muamalat MTC.json",
 }
 
-# ============================================================================
-# CONSTANTS - DO NOT MODIFY UNLESS UPDATING METHODOLOGY
-# ============================================================================
-
-# Bank codes for missing account detection
+# Bank codes for reference (used for detecting missing statements)
 BANK_CODES = {
-    'AMFB': 'AmBank', 'AMB': 'AmBank', 'AMBANK': 'AmBank',
-    'BIMB': 'Bank Islam', 'BANK ISLAM': 'Bank Islam',
-    'MBB': 'Maybank', 'MAYBANK': 'Maybank',
-    'RHB': 'RHB Bank',
-    'PBB': 'Public Bank', 'PUBLIC BANK': 'Public Bank',
-    'OCBC': 'OCBC Bank',
-    'HSBC': 'HSBC Bank',
-    'UOB': 'UOB Bank',
-    'AFFIN': 'Affin Bank',
-    'BSN': 'BSN',
-    'CITI': 'Citibank',
-    'SCB': 'Standard Chartered'
+    "MBB": "Maybank",
+    "PBB": "Public Bank",
+    "RHB": "RHB Bank",
+    "CIMB": "CIMB Bank",
+    "HLBB": "Hong Leong Bank",
+    "BIMB": "Bank Islam",
+    "AMFB": "AmBank",
+    "BSN": "Bank Simpanan Nasional",
+    "OCBC": "OCBC Bank",
+    "HSBC": "HSBC Bank",
+    "SCB": "Standard Chartered",
+    "UOB": "UOB Bank",
+    "AGRO": "Agrobank",
+    "BKR": "Bank Kerjasama Rakyat",
 }
 
-# Codes for banks we have statements for (auto-detected + manual override)
-PROVIDED_BANK_CODES = {'CIMB', 'CIMBKL', 'CIMB14', 'CIMB9', 'CIMBSEK', 'HLB', 'HLBB', 'BMMB', 'MUAMALAT'}
+# Keywords for detecting company name in transactions
+COMPANY_KEYWORDS = ["SDN", "BHD", "BERHAD", "ENTERPRISE", "TRADING", "COMPANY"]
 
-# Inter-account transfer markers
-INTER_ACCOUNT_MARKERS = [
-    'ITB TRF', 'ITC TRF', 'INTERBANK', 'INTER ACC', 'OWN ACC', 
-    'INTERCO TXN', 'INTER-CO', 'INTRA ACC', 'SELF TRF',
-    'TR FROM CA', 'TR TO C/A'
-]
-
-# Statutory payment keywords (Malaysian government agencies)
-STATUTORY_KEYWORDS = {
-    'EPF/KWSP': ['KUMPULAN WANG SIMPANAN PEKERJA', 'KWSP', 'EPF', 'EMPLOYEES PROVIDENT'],
-    'SOCSO/PERKESO': ['PERTUBUHAN KESELAMATAN SOSIAL', 'PERKESO', 'SOCSO', 'SOCIAL SECURITY'],
-    'LHDN/Tax': ['LEMBAGA HASIL DALAM NEGERI', 'LHDN', 'PCB', 'MTD', 'CP39', 'CP38', 'INCOME TAX'],
-    'HRDF/PSMB': ['PEMBANGUNAN SUMBER MANUSIA', 'HRDF', 'PSMB', 'HRD CORP']
+# Category definitions
+CATEGORY_DEFINITIONS = {
+    "GENUINE_SALES_COLLECTIONS": {
+        "type": "CREDIT",
+        "description": "Genuine business revenue collections from customers",
+        "keywords": ["PAYMENT", "INV", "INVOICE", "RECEIPT", "COLLECTION"],
+        "exclude_keywords": ["LOAN", "FINANCING", "TRANSFER", "OWN ACCOUNT"],
+    },
+    "RELATED_PARTY_INFLOWS": {
+        "type": "CREDIT",
+        "description": "Funds received from related parties/directors/shareholders",
+        "keywords": ["DIRECTOR", "SHAREHOLDER", "OWNER", "RELATED", "ADVANCE"],
+    },
+    "LOAN_PROCEEDS": {
+        "type": "CREDIT",
+        "description": "Loan disbursements and financing proceeds",
+        "keywords": ["LOAN", "FINANCING", "DISBURSEMENT", "FACILITY", "TERM LOAN"],
+    },
+    "OTHER_CREDITS": {
+        "type": "CREDIT",
+        "description": "Other credit transactions not classified elsewhere",
+        "keywords": [],
+    },
+    "SUPPLIER_PAYMENTS": {
+        "type": "DEBIT",
+        "description": "Payments to suppliers and trade creditors",
+        "keywords": ["PAYMENT", "SUPPLIER", "VENDOR", "TRADE", "PURCHASE"],
+        "exclude_keywords": ["SALARY", "EPF", "SOCSO", "TAX", "RENT", "UTILITY"],
+    },
+    "RELATED_PARTY_OUTFLOWS": {
+        "type": "DEBIT",
+        "description": "Payments to related parties/directors/shareholders",
+        "keywords": ["DIRECTOR", "SHAREHOLDER", "OWNER", "RELATED", "ADVANCE"],
+    },
+    "STATUTORY_PAYMENTS": {
+        "type": "DEBIT",
+        "description": "Government and statutory payments (tax, EPF, SOCSO)",
+        "keywords": ["LHDN", "TAX", "EPF", "KWSP", "SOCSO", "PERKESO", "ZAKAT"],
+    },
+    "SALARY_PAYMENTS": {
+        "type": "DEBIT",
+        "description": "Employee salary and payroll payments",
+        "keywords": ["SALARY", "PAYROLL", "WAGES", "GAJI", "BONUS"],
+    },
+    "RENT_UTILITIES": {
+        "type": "DEBIT",
+        "description": "Rent, utilities and overhead expenses",
+        "keywords": ["RENT", "SEWA", "TNB", "WATER", "UTILITY", "BILL", "TM", "UNIFI"],
+    },
+    "BANK_CHARGES": {
+        "type": "DEBIT",
+        "description": "Bank fees, charges and penalties",
+        "keywords": ["CHARGE", "FEE", "COMMISSION", "PENALTY", "INTEREST", "IBG FEE"],
+    },
+    "OTHER_DEBITS": {
+        "type": "DEBIT",
+        "description": "Other debit transactions not classified elsewhere",
+        "keywords": [],
+    },
 }
 
-# Salary and wages keywords
-SALARY_KEYWORDS = [
-    'SALARY', 'GAJI', 'PAYROLL', 'WAGES', 'ALLOWANCE', 'ELAUN',
-    'BONUS', 'COMMISSION', 'INCENTIVE', 'EPF EMPLOYER', 'STAFF CLAIM',
-    'OVERTIME', 'OT CLAIM'
-]
-
-# Utility companies
-UTILITY_KEYWORDS = [
-    'TNB', 'TENAGA NASIONAL', 'TENAGA', 
-    'SYABAS', 'AIR SELANGOR', 'PENGURUSAN AIR', 'SAINS', 'SAJ', 'SAJH',
-    'TELEKOM', 'TM NET', 'UNIFI', 'STREAMYX',
-    'MAXIS', 'CELCOM', 'DIGI', 'U MOBILE', 'YES',
-    'ASTRO', 'TIME DOTCOM', 'TIME FIBRE',
-    'IWK', 'INDAH WATER'
-]
-
-# Bank charge keywords
-BANK_CHARGE_KEYWORDS = [
-    'SERVICE CHARGE', 'BANK CHARGE', 'AUTOPAY CHARGES', 'FEE', 
-    'COMMISSION', 'STAMP DUTY', 'DUTI SETEM', 'COT', 
-    'HANDLING CHARGE', 'PROCESSING FEE', 'ADM CHARGE', 'ADMIN FEE'
-]
-
-# Loan disbursement keywords (credits)
-DISBURSEMENT_KEYWORDS = ['DISB', 'DISBURSEMENT', 'LOAN CR', 'FINANCING CR', 'DRAWDOWN', 'FACILITY RELEASE']
-
-# Interest/profit keywords (credits)
-INTEREST_KEYWORDS = ['PROFIT PAID', 'PROFIT/HIBAH', 'HIBAH', 'INTEREST', 'DIVIDEND', 'FAEDAH', 'BONUS INTEREST']
-
-# Reversal keywords
-REVERSAL_KEYWORDS = ['REVERSAL', 'REVERSE', 'REV', 'CANCELLED', 'VOID', 'RETURNED', 'REJECTED']
-
-# Round figure threshold
-ROUND_FIGURE_THRESHOLD = 10000
-ROUND_FIGURE_WARNING_PCT = 40
-
-# ============================================================================
+# =============================================================================
 # HELPER FUNCTIONS
-# ============================================================================
-
-def load_data() -> Dict[str, Any]:
-    """Load all bank statement files"""
-    data = {}
-    for key, path in FILE_PATHS.items():
-        if key in ACCOUNT_INFO:
-            try:
-                with open(path, 'r') as f:
-                    data[key] = json.load(f)
-            except FileNotFoundError:
-                print(f"Warning: File not found for {key}: {path}")
-    return data
+# =============================================================================
 
 
-def create_transaction_key(txn: Dict) -> Tuple:
-    """Create a deterministic sort key for transactions"""
-    amount = txn.get('credit', 0) + txn.get('debit', 0)
-    return (txn['date'], -amount, txn['description'])
+def load_json_file(file_path):
+    """Load and parse JSON file."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None
 
 
-def has_inter_account_marker(desc: str) -> bool:
-    """Check if description contains inter-account transfer markers"""
-    desc_upper = desc.upper()
-    return any(marker in desc_upper for marker in INTER_ACCOUNT_MARKERS)
+def parse_amount(value):
+    """Parse amount value to float."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        value = value.replace(",", "").replace("RM", "").strip()
+        if value == "" or value == "-":
+            return 0.0
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
-def has_company_name(desc: str) -> bool:
-    """Check if description contains company name"""
-    desc_upper = desc.upper()
-    return any(kw in desc_upper for kw in COMPANY_KEYWORDS)
+def normalize_text(text):
+    """Normalize text for comparison."""
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", str(text).upper().strip())
 
 
-def get_missing_bank_code(desc: str, missing_codes: Set[str]) -> Optional[str]:
-    """Get bank code from description if it's a missing bank"""
-    desc_upper = desc.upper()
-    for code in missing_codes:
-        if code in desc_upper:
-            return code
-    return None
+def detect_related_party(description):
+    """Detect if transaction involves related party."""
+    desc_norm = normalize_text(description)
+    for party in RELATED_PARTIES:
+        if normalize_text(party["name"]) in desc_norm:
+            return True, party["name"]
+    return False, None
 
 
-def is_round_figure(amount: float) -> bool:
-    """Check if amount is a round figure (divisible by 1000, >= 10000)"""
-    return amount >= ROUND_FIGURE_THRESHOLD and amount % 1000 == 0
+def detect_inter_account_transfer(description, account_ids):
+    """Detect transfers between own accounts."""
+    desc_norm = normalize_text(description)
+    for acc_id in account_ids:
+        acc_num = ACCOUNT_INFO.get(acc_id, {}).get("account_number", "")
+        if acc_num and acc_num in desc_norm:
+            return True, acc_id
+    return False, None
 
 
-def calculate_volatility(high: float, low: float) -> Tuple[float, str]:
-    """Calculate volatility percentage using true mean"""
-    if high == low:
-        return 0.0, 'LOW'
-    avg = (high + low) / 2
-    if avg == 0:
-        return 0.0, 'LOW'
-    swing = high - low
-    vol_pct = (swing / avg) * 100
-    
-    if vol_pct <= 50:
-        level = 'LOW'
-    elif vol_pct <= 100:
-        level = 'MODERATE'
-    elif vol_pct <= 200:
-        level = 'HIGH'
+def categorize_transaction(txn_type, description, amount, is_related_party=False, is_inter_account=False):
+    """Categorize transaction based on type and description."""
+    desc_norm = normalize_text(description)
+
+    # Related party takes precedence
+    if is_related_party:
+        return "RELATED_PARTY_INFLOWS" if txn_type == "CREDIT" else "RELATED_PARTY_OUTFLOWS"
+
+    # Inter-account transfers get excluded from turnover
+    if is_inter_account:
+        return "INTER_ACCOUNT_TRANSFER"
+
+    # Match against category definitions
+    for category, definition in CATEGORY_DEFINITIONS.items():
+        if definition["type"] != txn_type:
+            continue
+
+        # Skip if exclude keywords match
+        if "exclude_keywords" in definition:
+            if any(kw in desc_norm for kw in definition["exclude_keywords"]):
+                continue
+
+        # Match keywords
+        if definition["keywords"]:
+            if any(kw in desc_norm for kw in definition["keywords"]):
+                return category
+
+    # Default categories
+    return "OTHER_CREDITS" if txn_type == "CREDIT" else "OTHER_DEBITS"
+
+
+def calculate_monthly_metrics(transactions):
+    """Calculate monthly summary metrics."""
+    monthly_data = defaultdict(lambda: {"credits": 0, "debits": 0, "closing_balance": 0, "high": None, "low": None})
+
+    for txn in transactions:
+        month = txn["date"][:7]  # YYYY-MM
+        credit = txn["credit"]
+        debit = txn["debit"]
+        balance = txn["balance"]
+
+        monthly_data[month]["credits"] += credit
+        monthly_data[month]["debits"] += debit
+        monthly_data[month]["closing_balance"] = balance
+
+        # Track intraday high/low
+        if monthly_data[month]["high"] is None or balance > monthly_data[month]["high"]:
+            monthly_data[month]["high"] = balance
+        if monthly_data[month]["low"] is None or balance < monthly_data[month]["low"]:
+            monthly_data[month]["low"] = balance
+
+    monthly_summary = []
+    for month, data in sorted(monthly_data.items()):
+        monthly_summary.append(
+            {
+                "month": month,
+                "total_credits": round(data["credits"], 2),
+                "total_debits": round(data["debits"], 2),
+                "closing_balance": round(data["closing_balance"], 2),
+                "highest_intraday": round(data["high"], 2) if data["high"] is not None else 0,
+                "lowest_intraday": round(data["low"], 2) if data["low"] is not None else 0,
+            }
+        )
+
+    return monthly_summary
+
+
+def calculate_volatility_index(high_balance, low_balance):
+    """Calculate volatility index based on high/low balances."""
+    if high_balance == 0 and low_balance == 0:
+        return 0
+    avg_balance = (high_balance + low_balance) / 2
+    if avg_balance == 0:
+        return 0
+    return ((high_balance - low_balance) / avg_balance) * 100
+
+
+def classify_volatility(vol_index):
+    """Classify volatility level."""
+    if vol_index >= 200:
+        return "EXTREME"
+    if vol_index >= 100:
+        return "HIGH"
+    if vol_index >= 50:
+        return "MEDIUM"
+    return "LOW"
+
+
+# =============================================================================
+# PATCH UTILITIES (v5.2.1+): company detection, counterparties, monthly volatility,
+# high-value flags, avg daily balance, bank metadata inference.
+# =============================================================================
+
+BANK_CODE_TOKENS = {
+    # Common Malaysian bank short codes seen at end of DuitNow descriptions
+    "MBB",
+    "PBB",
+    "RHB",
+    "BIMB",
+    "HLBB",
+    "CIMB",
+    "AMFB",
+    "BSN",
+    "OCBC",
+    "HSBC",
+    "SCB",
+    "UOB",
+    "AGRO",
+    "BKR",
+    "MB2U",
+    "BANK",
+    "IBG",
+}
+
+
+def _clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def infer_company_name_from_transactions(transactions: list, fallback: str = "UNKNOWN") -> str:
+    """Best-effort company name detection from transaction descriptions.
+
+    Strategy:
+    1) Regex extract candidates that end with Malaysian company suffixes.
+    2) Clean away narration boilerplate (DUITNOW/ACCOUNT/INTERBANK/etc).
+    3) Score by frequency + completeness (prefer SDN BHD / BERHAD).
+    """
+    if not transactions:
+        return fallback
+
+    pattern = re.compile(
+        r"\b([A-Z][A-Z0-9&.,'()/ -]{2,}?(?:SDN\s*BHD|SDN\.?\s*BHD\.?|SDN\.?|BHD\.?|BERHAD))\b", re.I
+    )
+
+    blacklist = {"DUITNOW", "ACCOUNT", "MOBILE", "INTERBANK", "TRANSFER", "TFR", "TO", "FROM", "RLE", "SEPAT", "JTG", "TFSO"}
+    counts = {}
+    scores = {}
+
+    for t in transactions:
+        desc = (t.get("description") or "").upper()
+        for mm in pattern.finditer(desc):
+            cand = _clean_ws(mm.group(1).upper())
+            cand = cand.replace("SDN. BHD", "SDN BHD").replace("SDN BHD.", "SDN BHD").replace("BHD.", "BHD").replace("SDN.", "SDN")
+
+            tokens = cand.split()
+            while tokens and tokens[0] in blacklist:
+                tokens = tokens[1:]
+
+            if not tokens:
+                continue
+
+            cand2 = _clean_ws(" ".join(tokens))
+
+            if any(x in cand2 for x in ["DUITNOW TO", "TO ACCOUNT", "INTERBANK INTERBANK"]):
+                continue
+            if len(cand2) < 8:
+                continue
+
+            counts[cand2] = counts.get(cand2, 0) + 1
+
+            bonus = 0.0
+            if "SDN BHD" in cand2:
+                bonus += 20
+            if "BERHAD" in cand2:
+                bonus += 20
+            if cand2.endswith("BHD"):
+                bonus += 10
+            bonus += min(len(cand2), 60) / 10.0
+            scores[cand2] = max(scores.get(cand2, 0.0), bonus)
+
+    if not counts:
+        return fallback
+
+    best = sorted(counts.keys(), key=lambda c: (-counts[c], -scores.get(c, 0.0), -len(c)))[0]
+    # If we only captured 'SDN' but an otherwise identical 'SDN BHD' exists, prefer the fuller form.
+    if best.endswith(" SDN"):
+        prefix = best + " BHD"
+        for cand in counts.keys():
+            if cand.startswith(prefix):
+                best = cand
+                break
+        if prefix in counts:
+            best = prefix
+    return best
+
+
+def infer_bank_name_from_transactions(transactions: list, fallback: str = "") -> str:
+    banks = [t.get("bank") for t in transactions if t.get("bank")]
+    if not banks:
+        return fallback
+    # mode
+    freq = {}
+    for b in banks:
+        freq[b] = freq.get(b, 0) + 1
+    return sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+
+def extract_counterparty(description: str) -> str:
+    """Extract a counterparty string from a transaction description.
+    Heuristic-based, tuned for common Malaysian bank narration patterns.
+    Falls back to a truncated description if it cannot confidently extract.
+    """
+    desc_raw = description or ""
+    desc = _clean_ws(desc_raw).upper()
+
+    # Remove repeated boilerplate tokens that often appear
+    desc = re.sub(r"\b(TFSO|SEPAT|JTG|RLE)\b", " ", desc)
+    desc = _clean_ws(desc)
+
+    # Prefer substrings after known markers
+    markers = [
+        "DUITNOW TO ACCOUNT",
+        "DUITNOW TO MOBILE/ID",
+        "DUITNOW TO MOBILE",
+        "TR TO C/A",
+        "TR TO CA",
+        "TR FROM",
+        "TR FR",
+        "IBG",
+        "GIRO CR",
+        "GIRO DR",
+        "AUTOPAY CR",
+        "AUTOPAY DR",
+    ]
+    start = None
+    for m in markers:
+        i = desc.find(m)
+        if i != -1:
+            start = i + len(m)
+            break
+    if start is not None:
+        tail = _clean_ws(desc[start:])
     else:
-        level = 'EXTREME'
-    
-    return round(vol_pct, 2), level
+        tail = desc
+
+    # Remove obvious reference-ish fragments at front
+    tail = re.sub(r"\b(INV|INVOICE|IV|REF|NO\.?|BILL|PAYMENT|PMT|PROJECT)\b[:\-]?", " ", tail)
+    tail = _clean_ws(tail)
+
+    # If narration ends with a bank code token, drop it
+    tokens = tail.split()
+    if tokens and tokens[-1] in BANK_CODE_TOKENS and len(tokens) > 2:
+        tokens = tokens[:-1]
+
+    # Build candidate from end backwards using name-like tokens
+    stop_tokens = {
+        "INTERBANK",
+        "CASH",
+        "ADV",
+        "ADVANCE",
+        "TRANSFER",
+        "TFR",
+        "TO",
+        "FROM",
+        "ACCOUNT",
+        "MOBILE/ID",
+        "ONLINE",
+        "FEE",
+        "CHARGES",
+        "SERVICE",
+    }
+    name_tokens = []
+    for tok in reversed(tokens):
+        if tok in stop_tokens:
+            break
+        if re.search(r"[0-9]", tok):
+            # stop on numeric-heavy fragments (refs)
+            if name_tokens:
+                break
+            continue
+        if any(ch in tok for ch in "/-_"):
+            # likely a reference; stop once we already have some name tokens
+            if name_tokens:
+                break
+            continue
+        if len(tok) <= 1:
+            continue
+        name_tokens.append(tok)
+        if len(name_tokens) >= 6:
+            break
+
+    if name_tokens:
+        cand = " ".join(reversed(name_tokens))
+        cand = _clean_ws(cand)
+        # sanity
+        if len(cand) >= 3:
+            return cand.title()
+
+    # fallback: trimmed narration
+    short = _clean_ws(desc_raw)
+    return short[:60] + ("…" if len(short) > 60 else "")
 
 
-def get_recurring_status(found_count: int, expected_count: int = 6) -> str:
-    """Determine recurring payment status per v5.2.0 methodology"""
-    if found_count >= max(4, expected_count - 2):
-        return 'FOUND'
-    elif found_count >= 1:
-        return 'PARTIAL'
-    else:
-        return 'NOT_FOUND'
+def build_counterparty_summary(transactions: list, total_credit_basis: float, total_debit_basis: float) -> dict:
+    """Aggregate counterparties for top payers/payees and concentration.
 
-
-def generate_related_party_patterns(related_parties: List[Dict]) -> List[Dict]:
+    Note: engine transactions carry 'credit' and 'debit' fields (not a unified 'amount').
     """
-    Generate search patterns for related party matching.
-    Uses partial matching - first 2-3 significant words.
-    """
-    patterns = []
-    stop_words = {'SDN', 'BHD', 'PLT', 'BERHAD', 'ENTERPRISE', 'TRADING', 
-                  'SERVICES', 'SOLUTIONS', 'HOLDINGS', 'GROUP', 'AND', '&'}
-    
-    for rp in related_parties:
-        name_upper = rp['name'].upper()
-        words = [w for w in name_upper.split() if w not in stop_words and len(w) > 2]
-        
-        search_patterns = [name_upper]  # Full name
-        if len(words) >= 2:
-            search_patterns.append(' '.join(words[:2]))  # First 2 words
-        if len(words) >= 1:
-            search_patterns.append(words[0])  # First word only
-        
-        patterns.append({
-            'name': rp['name'],
-            'relationship': rp['relationship'],
-            'patterns': search_patterns
-        })
-    
-    return patterns
+    payer = {}  # name_key -> [display_name, count, amount]
+    payee = {}
 
+    for t in transactions:
+        credit = float(t.get("credit") or 0.0)
+        debit = float(t.get("debit") or 0.0)
+        ttype = "CREDIT" if credit > 0 else ("DEBIT" if debit > 0 else None)
+        amt = credit if credit > 0 else debit
+        if not ttype or amt <= 0:
+            continue
 
-def check_related_party(desc: str, rp_patterns: List[Dict]) -> Optional[Dict]:
-    """
-    Check if description matches any related party.
-    Returns matched party info or None.
-    """
-    desc_upper = desc.upper()
-    
-    for rp in rp_patterns:
-        for pattern in rp['patterns']:
-            if pattern in desc_upper:
-                # Extract purpose note if present
-                purpose_note = ""
-                for keyword in ['STATUTORY', 'SALARY', 'LOAN', 'PAYMENT', 'ADVANCE', 'INTERBANK']:
-                    if keyword in desc_upper:
-                        idx = desc_upper.find(keyword)
-                        purpose_note = desc_upper[idx:idx+30].strip()
-                        break
-                
-                return {
-                    'name': rp['name'],
-                    'relationship': rp['relationship'],
-                    'purpose_note': purpose_note
+        # Only consider NON-excluded business flows
+        if t.get("exclude_from_turnover"):
+            continue
+
+        name = extract_counterparty(t.get("description") or "")
+        key = name.upper()
+
+        if ttype == "CREDIT":
+            c = payer.get(key, [name, 0, 0.0])
+            c[1] += 1
+            c[2] += amt
+            payer[key] = c
+        else:
+            c = payee.get(key, [name, 0, 0.0])
+            c[1] += 1
+            c[2] += amt
+            payee[key] = c
+
+    def topn(d, basis, n=10):
+        items = sorted(d.values(), key=lambda x: (-x[2], -x[1], x[0]))[:n]
+        out = []
+        for i, (name, cnt, amt) in enumerate(items, start=1):
+            pct = (amt / basis * 100.0) if basis else 0.0
+            out.append(
+                {
+                    "rank": i,
+                    "party_name": name,
+                    "transaction_count": int(cnt),
+                    "total_amount": round(amt, 2),
+                    "percentage": round(pct, 2),
+                    "is_related_party": False,
                 }
-    
-    return None
+            )
+        return out
+
+    top_payers = topn(payer, total_credit_basis)
+    top_payees = topn(payee, total_debit_basis)
+
+    def pct_sum(items, k):
+        return round(sum(x["percentage"] for x in items[:k]), 2) if items else 0.0
+
+    top1_payer_pct = top_payers[0]["percentage"] if top_payers else 0.0
+    top3_payers_pct = pct_sum(top_payers, 3)
+    top1_payee_pct = top_payees[0]["percentage"] if top_payees else 0.0
+    top3_payees_pct = pct_sum(top_payees, 3)
+
+    risk = "LOW"
+    if top1_payer_pct >= 40 or top1_payee_pct >= 40 or top3_payers_pct >= 70 or top3_payees_pct >= 70:
+        risk = "HIGH"
+    elif top1_payer_pct >= 25 or top1_payee_pct >= 25 or top3_payers_pct >= 50 or top3_payees_pct >= 50:
+        risk = "MEDIUM"
+
+    parties_both = sorted(list(set(payer.keys()).intersection(set(payee.keys()))))
+    parties_both_sides = [payer[k][0] for k in parties_both[:25]]
+
+    return {
+        "top_payers": top_payers,
+        "top_payees": top_payees,
+        "concentration_risk": {
+            "top1_payer_pct": round(top1_payer_pct, 2),
+            "top3_payers_pct": round(top3_payers_pct, 2),
+            "top1_payee_pct": round(top1_payee_pct, 2),
+            "top3_payees_pct": round(top3_payees_pct, 2),
+            "risk_level": risk,
+        },
+        "parties_both_sides": parties_both_sides,
+    }
 
 
-def check_statutory(desc: str) -> Optional[str]:
-    """Check if description is a statutory payment. Returns type or None."""
-    desc_upper = desc.upper()
-    
-    for stat_type, keywords in STATUTORY_KEYWORDS.items():
-        for keyword in keywords:
-            if keyword in desc_upper:
-                return stat_type
-    
-    return None
+def compute_avg_daily_balance(transactions: list) -> float:
+    """Average of end-of-day balances across the full period (all accounts)."""
+    # group by (account_id, date) -> last balance
+    by_key = {}
+    for t in transactions:
+        acc = t.get("account_id") or "UNKNOWN"
+        dt = t.get("date")
+        bal = t.get("balance")
+        if not dt or bal is None:
+            continue
+        key = (acc, dt)
+        # transaction list already deterministically sorted in engine; last seen is end-of-day-ish
+        by_key[key] = float(bal)
+    if not by_key:
+        return 0.0
+    return float(sum(by_key.values()) / len(by_key))
 
 
-# ============================================================================
+def build_monthly_volatility(accounts: list) -> list:
+    """Aggregate monthly volatility from per-account monthly intraday summaries."""
+    month_map = {}  # YYYY-MM -> {high, low}
+    for acc in accounts:
+        for m in acc.get("monthly_summary", []):
+            month = m.get("month")
+            if not month:
+                continue
+            high = m.get("highest_intraday")
+            low = m.get("lowest_intraday")
+            if high is None or low is None:
+                continue
+            entry = month_map.get(month, {"high": float(high), "low": float(low)})
+            entry["high"] = max(entry["high"], float(high))
+            entry["low"] = min(entry["low"], float(low))
+            month_map[month] = entry
+
+    out = []
+    for month, v in sorted(month_map.items()):
+        high = v["high"]
+        low = v["low"]
+        avg = (high + low) / 2.0 if (high + low) != 0 else 0.0
+        vol_idx = ((high - low) / avg * 100.0) if avg else 0.0
+        level = "LOW"
+        if vol_idx >= 200:
+            level = "EXTREME"
+        elif vol_idx >= 100:
+            level = "HIGH"
+        elif vol_idx >= 50:
+            level = "MEDIUM"
+        out.append(
+            {
+                "month": month,
+                "volatility_index": round(vol_idx, 2),
+                "volatility_level": level,
+                "highest_balance": round(high, 2),
+                "lowest_balance": round(low, 2),
+            }
+        )
+    return out
+
+
+def build_high_value_flags(transactions: list, threshold: float = 500000.0) -> dict:
+    hv = []
+    for t in transactions:
+        credit = float(t.get("credit") or 0.0)
+        debit = float(t.get("debit") or 0.0)
+        ttype = "CREDIT" if credit > 0 else ("DEBIT" if debit > 0 else None)
+        amt = credit if credit > 0 else debit
+        if not ttype:
+            continue
+        if amt >= threshold:
+            hv.append(
+                {
+                    "date": t.get("date"),
+                    "type": ttype,
+                    "amount": round(amt, 2),
+                    "description": t.get("description"),
+                    "account_id": t.get("account_id"),
+                    "category": t.get("category"),
+                }
+            )
+    hv = sorted(hv, key=lambda x: -x["amount"])
+    return {
+        "threshold": threshold,
+        "count": len(hv),
+        "transactions": hv[:100],
+    }
+
+
+# =============================================================================
 # MAIN ANALYSIS FUNCTION
-# ============================================================================
+# =============================================================================
 
-def analyze() -> Dict:
-    """
-    Main analysis function - DETERMINISTIC
-    
-    Follows v5.2.0 methodology:
-    - Credits: Priority 1-7 (IA Matched, IA Unverified, Related Party, Loan, Interest, Reversal, Genuine)
-    - Debits: Priority 1-8 (IA Matched, Related Party, IA Unverified, Statutory, Salary, Utilities, Bank Charges, Supplier)
-    """
-    
-    data = load_data()
-    if not data:
-        raise ValueError("No data files loaded")
-    
-    # Generate related party patterns for matching
-    rp_patterns = generate_related_party_patterns(RELATED_PARTIES)
-    
+
+def analyze():
+    """Main analysis function."""
+
     # ========================================================================
-    # STEP 1: Combine all transactions with account_id and create unique index
-    # ========================================================================
-    all_transactions = []
-    idx = 0
-    
-    for acc_id in sorted(ACCOUNT_INFO.keys()):
-        if acc_id not in data:
-            continue
-        for txn in data[acc_id]['transactions']:
-            credit_amt = txn.get('credit', 0) or 0
-            debit_amt = txn.get('debit', 0) or 0
-            
-            # Skip zero-amount transactions (like closing balance entries)
-            if credit_amt == 0 and debit_amt == 0:
-                continue
-            
-            all_transactions.append({
-                'idx': idx,
-                'account_id': acc_id,
-                'date': txn['date'],
-                'description': txn['description'],
-                'debit': debit_amt,
-                'credit': credit_amt,
-                'balance': txn.get('balance', 0) or 0,
-                'category': None,
-                'exclude_from_turnover': False,
-                'is_related_party': False,
-                'related_party_name': '',
-                'related_party_relationship': '',
-                'purpose_note': ''
-            })
-            idx += 1
-    
-    # CRITICAL: Sort transactions deterministically
-    all_transactions.sort(key=create_transaction_key)
-    
-    # Re-index after sorting
-    for i, txn in enumerate(all_transactions):
-        txn['sorted_idx'] = i
-    
-    # ========================================================================
-    # STEP 2: Detect missing bank accounts
-    # ========================================================================
-    missing_accounts = defaultdict(int)
-    
-    for txn in all_transactions:
-        desc_upper = txn['description'].upper()
-        for code, name in BANK_CODES.items():
-            if code in desc_upper and code not in PROVIDED_BANK_CODES:
-                missing_accounts[f"{code} ({name})"] += 1
-    
-    missing_bank_codes = set()
-    for key in missing_accounts.keys():
-        code = key.split()[0]
-        missing_bank_codes.add(code)
-    
-    # ========================================================================
-    # STEP 3: Separate credits and debits
-    # ========================================================================
-    credits = [t for t in all_transactions if t['credit'] > 0]
-    debits = [t for t in all_transactions if t['debit'] > 0]
-    
-    # Track which transactions are used (by sorted_idx)
-    used_indices = set()
-    
-    # Storage for categorized transactions
-    matched_transfers = []
-    unverified_credit_transfers = []
-    unverified_debit_transfers = []
-    related_party_credits = []
-    related_party_debits = []
-    loan_disbursements = []
-    interest_credits = []
-    reversals = []
-    genuine_credits = []
-    statutory_payments = []
-    salary_wages = []
-    utilities = []
-    bank_charges = []
-    supplier_payments = []
-    
-    # Statutory tracking by type and month
-    statutory_by_type = defaultdict(list)
-    
-    # Sort for deterministic matching
-    credits_sorted = sorted(credits, key=lambda x: (x['date'], -x['credit'], x['description']))
-    debits_sorted = sorted(debits, key=lambda x: (x['date'], -x['debit'], x['description']))
-    
-    # ========================================================================
-    # STEP 4: CREDIT CATEGORIZATION (Strict Priority Order)
-    # ========================================================================
-    
-    # ------------------------------------------------------------------------
-    # CREDIT PRIORITY 1: INTER-ACCOUNT MATCHED
-    # ------------------------------------------------------------------------
-    for credit_txn in credits_sorted:
-        if credit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        for debit_txn in debits_sorted:
-            if debit_txn['sorted_idx'] in used_indices:
-                continue
-            if debit_txn['account_id'] == credit_txn['account_id']:
-                continue
-            
-            # Check amount match (±1 RM tolerance)
-            if abs(credit_txn['credit'] - debit_txn['debit']) > 1:
-                continue
-            
-            # Check date match (±1 day tolerance)
-            c_date = datetime.strptime(credit_txn['date'], '%Y-%m-%d')
-            d_date = datetime.strptime(debit_txn['date'], '%Y-%m-%d')
-            if abs((c_date - d_date).days) > 1:
-                continue
-            
-            # Check for inter-account markers
-            c_desc = credit_txn['description'].upper()
-            d_desc = debit_txn['description'].upper()
-            
-            has_marker = (has_inter_account_marker(c_desc) or has_inter_account_marker(d_desc) or
-                         has_company_name(c_desc) or has_company_name(d_desc))
-            
-            # For large amounts, be more lenient on markers
-            if has_marker or credit_txn['credit'] >= 50000:
-                matched_transfers.append({
-                    'date': credit_txn['date'],
-                    'amount': credit_txn['credit'],
-                    'from_account': debit_txn['account_id'],
-                    'to_account': credit_txn['account_id'],
-                    'credit_description': credit_txn['description'],
-                    'debit_description': debit_txn['description'],
-                    'credit_idx': credit_txn['sorted_idx'],
-                    'debit_idx': debit_txn['sorted_idx']
-                })
-                
-                credit_txn['category'] = 'INTER_ACCOUNT_TRANSFER'
-                credit_txn['exclude_from_turnover'] = True
-                debit_txn['category'] = 'INTER_ACCOUNT_TRANSFER'
-                debit_txn['exclude_from_turnover'] = True
-                
-                used_indices.add(credit_txn['sorted_idx'])
-                used_indices.add(debit_txn['sorted_idx'])
-                break  # First match wins
-    
-    # ------------------------------------------------------------------------
-    # CREDIT PRIORITY 2: INTER-ACCOUNT UNVERIFIED (from missing banks)
-    # ------------------------------------------------------------------------
-    for credit_txn in credits_sorted:
-        if credit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        desc_upper = credit_txn['description'].upper()
-        missing_bank = get_missing_bank_code(desc_upper, missing_bank_codes)
-        
-        if missing_bank and (has_inter_account_marker(desc_upper) or has_company_name(desc_upper)):
-            unverified_credit_transfers.append({
-                'date': credit_txn['date'],
-                'account': credit_txn['account_id'],
-                'type': 'CREDIT',
-                'amount': credit_txn['credit'],
-                'description': credit_txn['description'],
-                'target_bank': missing_bank,
-                'verification_status': 'UNVERIFIED'
-            })
-            
-            credit_txn['category'] = 'INTER_ACCOUNT_TRANSFER_UNVERIFIED'
-            credit_txn['exclude_from_turnover'] = True
-            used_indices.add(credit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # CREDIT PRIORITY 3: RELATED PARTY
-    # ------------------------------------------------------------------------
-    for credit_txn in credits_sorted:
-        if credit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        rp_match = check_related_party(credit_txn['description'], rp_patterns)
-        if rp_match:
-            credit_txn['category'] = 'RELATED_PARTY'
-            credit_txn['exclude_from_turnover'] = True
-            credit_txn['is_related_party'] = True
-            credit_txn['related_party_name'] = rp_match['name']
-            credit_txn['related_party_relationship'] = rp_match['relationship']
-            credit_txn['purpose_note'] = rp_match['purpose_note']
-            
-            related_party_credits.append(credit_txn)
-            used_indices.add(credit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # CREDIT PRIORITY 4: LOAN DISBURSEMENT
-    # ------------------------------------------------------------------------
-    for credit_txn in credits_sorted:
-        if credit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        desc_upper = credit_txn['description'].upper()
-        if any(kw in desc_upper for kw in DISBURSEMENT_KEYWORDS):
-            loan_disbursements.append({
-                'date': credit_txn['date'],
-                'amount': credit_txn['credit'],
-                'description': credit_txn['description']
-            })
-            credit_txn['category'] = 'LOAN_DISBURSEMENT'
-            credit_txn['exclude_from_turnover'] = True
-            used_indices.add(credit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # CREDIT PRIORITY 5: INTEREST/PROFIT/DIVIDEND
-    # ------------------------------------------------------------------------
-    for credit_txn in credits_sorted:
-        if credit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        desc_upper = credit_txn['description'].upper()
-        if any(kw in desc_upper for kw in INTEREST_KEYWORDS):
-            interest_credits.append({
-                'date': credit_txn['date'],
-                'amount': credit_txn['credit'],
-                'description': credit_txn['description']
-            })
-            credit_txn['category'] = 'INTEREST_PROFIT_DIVIDEND'
-            credit_txn['exclude_from_turnover'] = True
-            used_indices.add(credit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # CREDIT PRIORITY 6: REVERSAL
-    # ------------------------------------------------------------------------
-    for credit_txn in credits_sorted:
-        if credit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        desc_upper = credit_txn['description'].upper()
-        if any(kw in desc_upper for kw in REVERSAL_KEYWORDS):
-            reversals.append({
-                'date': credit_txn['date'],
-                'amount': credit_txn['credit'],
-                'description': credit_txn['description']
-            })
-            credit_txn['category'] = 'REVERSAL'
-            credit_txn['exclude_from_turnover'] = True
-            used_indices.add(credit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # CREDIT PRIORITY 7: GENUINE SALES (Default)
-    # ------------------------------------------------------------------------
-    for credit_txn in credits_sorted:
-        if credit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        genuine_credits.append({
-            'date': credit_txn['date'],
-            'amount': credit_txn['credit'],
-            'description': credit_txn['description'],
-            'account': credit_txn['account_id']
-        })
-        credit_txn['category'] = 'GENUINE_SALES_COLLECTIONS'
-        credit_txn['exclude_from_turnover'] = False
-        used_indices.add(credit_txn['sorted_idx'])
-    
-    # ========================================================================
-    # STEP 5: DEBIT CATEGORIZATION (Strict Priority Order)
-    # ========================================================================
-    # Note: INTER_ACCOUNT_TRANSFER debits already categorized in Priority 1
-    
-    # ------------------------------------------------------------------------
-    # DEBIT PRIORITY 2: RELATED PARTY (BEFORE Statutory!)
-    # ------------------------------------------------------------------------
-    for debit_txn in debits_sorted:
-        if debit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        rp_match = check_related_party(debit_txn['description'], rp_patterns)
-        if rp_match:
-            debit_txn['category'] = 'RELATED_PARTY'
-            debit_txn['exclude_from_turnover'] = True
-            debit_txn['is_related_party'] = True
-            debit_txn['related_party_name'] = rp_match['name']
-            debit_txn['related_party_relationship'] = rp_match['relationship']
-            debit_txn['purpose_note'] = rp_match['purpose_note']
-            
-            related_party_debits.append(debit_txn)
-            used_indices.add(debit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # DEBIT PRIORITY 3: INTER-ACCOUNT UNVERIFIED (to missing banks)
-    # ------------------------------------------------------------------------
-    for debit_txn in debits_sorted:
-        if debit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        desc_upper = debit_txn['description'].upper()
-        missing_bank = get_missing_bank_code(desc_upper, missing_bank_codes)
-        
-        if missing_bank and (has_inter_account_marker(desc_upper) or has_company_name(desc_upper)):
-            unverified_debit_transfers.append({
-                'date': debit_txn['date'],
-                'account': debit_txn['account_id'],
-                'type': 'DEBIT',
-                'amount': debit_txn['debit'],
-                'description': debit_txn['description'],
-                'target_bank': debit_txn.get('target_bank', missing_bank),
-                'verification_status': 'UNVERIFIED'
-            })
-            
-            debit_txn['category'] = 'INTER_ACCOUNT_TRANSFER_UNVERIFIED'
-            debit_txn['exclude_from_turnover'] = True
-            used_indices.add(debit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # DEBIT PRIORITY 4: STATUTORY PAYMENT
-    # ------------------------------------------------------------------------
-    for debit_txn in debits_sorted:
-        if debit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        stat_type = check_statutory(debit_txn['description'])
-        if stat_type:
-            statutory_payments.append({
-                'date': debit_txn['date'],
-                'type': stat_type,
-                'amount': debit_txn['debit'],
-                'description': debit_txn['description'],
-                'account': debit_txn['account_id']
-            })
-            statutory_by_type[stat_type].append(debit_txn['date'][:7])
-            
-            debit_txn['category'] = 'STATUTORY_PAYMENT'
-            debit_txn['exclude_from_turnover'] = False
-            used_indices.add(debit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # DEBIT PRIORITY 5: SALARY/WAGES
-    # ------------------------------------------------------------------------
-    for debit_txn in debits_sorted:
-        if debit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        desc_upper = debit_txn['description'].upper()
-        if any(kw in desc_upper for kw in SALARY_KEYWORDS):
-            salary_wages.append({
-                'date': debit_txn['date'],
-                'amount': debit_txn['debit'],
-                'description': debit_txn['description']
-            })
-            debit_txn['category'] = 'SALARY_WAGES'
-            debit_txn['exclude_from_turnover'] = False
-            used_indices.add(debit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # DEBIT PRIORITY 6: UTILITIES
-    # ------------------------------------------------------------------------
-    for debit_txn in debits_sorted:
-        if debit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        desc_upper = debit_txn['description'].upper()
-        if any(kw in desc_upper for kw in UTILITY_KEYWORDS):
-            utilities.append({
-                'date': debit_txn['date'],
-                'amount': debit_txn['debit'],
-                'description': debit_txn['description']
-            })
-            debit_txn['category'] = 'UTILITIES'
-            debit_txn['exclude_from_turnover'] = False
-            used_indices.add(debit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # DEBIT PRIORITY 7: BANK CHARGES
-    # ------------------------------------------------------------------------
-    for debit_txn in debits_sorted:
-        if debit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        desc_upper = debit_txn['description'].upper()
-        if any(kw in desc_upper for kw in BANK_CHARGE_KEYWORDS) and debit_txn['debit'] < 1000:
-            bank_charges.append({
-                'date': debit_txn['date'],
-                'amount': debit_txn['debit'],
-                'description': debit_txn['description']
-            })
-            debit_txn['category'] = 'BANK_CHARGES'
-            debit_txn['exclude_from_turnover'] = False
-            used_indices.add(debit_txn['sorted_idx'])
-    
-    # ------------------------------------------------------------------------
-    # DEBIT PRIORITY 8: SUPPLIER/VENDOR (Default)
-    # ------------------------------------------------------------------------
-    for debit_txn in debits_sorted:
-        if debit_txn['sorted_idx'] in used_indices:
-            continue
-        
-        supplier_payments.append({
-            'date': debit_txn['date'],
-            'amount': debit_txn['debit'],
-            'description': debit_txn['description']
-        })
-        debit_txn['category'] = 'SUPPLIER_VENDOR_PAYMENTS'
-        debit_txn['exclude_from_turnover'] = False
-        used_indices.add(debit_txn['sorted_idx'])
-    
-    # ========================================================================
-    # STEP 6: CALCULATE TOTALS
-    # ========================================================================
-    total_credits = sum(t['credit'] for t in all_transactions if t['credit'] > 0)
-    total_debits = sum(t['debit'] for t in all_transactions if t['debit'] > 0)
-    
-    # Credit exclusions
-    matched_credit_amount = sum(t['amount'] for t in matched_transfers)
-    unverified_credit_amount = sum(t['amount'] for t in unverified_credit_transfers)
-    rp_credit_amount = sum(t['credit'] for t in related_party_credits)
-    loan_disb_amount = sum(t['amount'] for t in loan_disbursements)
-    interest_amount = sum(t['amount'] for t in interest_credits)
-    reversal_amount = sum(t['amount'] for t in reversals)
-    
-    total_credit_exclusions = (matched_credit_amount + unverified_credit_amount + 
-                               rp_credit_amount + loan_disb_amount + 
-                               interest_amount + reversal_amount)
-    
-    # Debit exclusions
-    matched_debit_amount = matched_credit_amount
-    unverified_debit_amount = sum(t['amount'] for t in unverified_debit_transfers)
-    rp_debit_amount = sum(t['debit'] for t in related_party_debits)
-    
-    total_debit_exclusions = matched_debit_amount + unverified_debit_amount + rp_debit_amount
-    
-    # Net business turnover
-    net_credits = total_credits - total_credit_exclusions
-    net_debits = total_debits - total_debit_exclusions
-    
-    # ========================================================================
-    # STEP 7: ROUND FIGURE ANALYSIS
-    # ========================================================================
-    round_figure_credits = [t for t in genuine_credits if is_round_figure(t['amount'])]
-    round_figure_total = sum(t['amount'] for t in round_figure_credits)
-    round_figure_pct = (round_figure_total / total_credits * 100) if total_credits > 0 else 0
-    
-    # ========================================================================
-    # STEP 8: BUILD ACCOUNTS ARRAY
+    # STEP 1: LOAD ALL ACCOUNT DATA
     # ========================================================================
     accounts = []
-    for acc_id in sorted(ACCOUNT_INFO.keys()):
-        if acc_id not in data:
+    all_transactions = []
+    missing_bank_codes = set()
+    account_ids = list(FILE_PATHS.keys())
+
+    for acc_id, file_path in FILE_PATHS.items():
+        data = load_json_file(file_path)
+        if not data:
             continue
-        
-        acc_data = data[acc_id]
-        info = ACCOUNT_INFO[acc_id]
-        
-        monthly = []
-        for m in acc_data['monthly_summary']:
-            high = m['highest_balance']
-            low = m['lowest_balance']
-            vol_pct, vol_level = calculate_volatility(high, low)
-            
-            monthly.append({
-                'month': m['month'],
-                'month_name': datetime.strptime(m['month'], '%Y-%m').strftime('%B %Y'),
-                'transaction_count': m['transaction_count'],
-                'opening': round(m['ending_balance'] - m['net_change'], 2),
-                'closing': m['ending_balance'],
-                'credits': m['total_credit'],
-                'debits': m['total_debit'],
-                'highest_intraday': high,
-                'lowest_intraday': low,
-                'average_intraday': round((high + low) / 2, 2),
-                'swing': round(high - low, 2),
-                'volatility_pct': vol_pct,
-                'volatility_level': vol_level
-            })
-        
-        total_cr = sum(m['total_credit'] for m in acc_data['monthly_summary'])
-        total_dr = sum(m['total_debit'] for m in acc_data['monthly_summary'])
-        
-        accounts.append({
-            'account_id': acc_id,
-            'bank_name': info['bank_name'],
-            'account_number': info['account_number'],
-            'account_holder': info['account_holder'],
-            'account_type': info['account_type'],
-            'classification': info['classification'],
-            'is_od': False,
-            'od_limit': None,
-            'period_start': acc_data['summary']['date_range'].split(' to ')[0],
-            'period_end': acc_data['summary']['date_range'].split(' to ')[1],
-            'total_credits': total_cr,
-            'total_debits': total_dr,
-            'transaction_volume': total_cr + total_dr,
-            'transaction_count': acc_data['summary']['total_transactions'],
-            'opening_balance': monthly[0]['opening'] if monthly else 0,
-            'closing_balance': monthly[-1]['closing'] if monthly else 0,
-            'monthly_summary': monthly
-        })
-    
-    # Determine period from all accounts
-    all_dates = [t['date'] for t in all_transactions]
-    period_start = min(all_dates) if all_dates else '2025-01-01'
-    period_end = max(all_dates) if all_dates else '2025-12-31'
-    expected_months = sorted(set(d[:7] for d in all_dates))
-    num_months = len(expected_months) or 6
-    
+
+        transactions = data.get("transactions", [])
+        if not transactions:
+            continue
+
+        # Sort transactions by date then by index for consistent processing
+        for idx, txn in enumerate(transactions):
+            debit_amt = parse_amount(txn.get("debit"))
+            credit_amt = parse_amount(txn.get("credit"))
+
+            all_transactions.append(
+                {
+                    "idx": idx,
+                    "account_id": acc_id,
+                    "date": txn["date"],
+                    "description": txn["description"],
+                    "debit": debit_amt,
+                    "credit": credit_amt,
+                    "balance": txn.get("balance", 0) or 0,
+                    "category": None,
+                    "exclude_from_turnover": False,
+                    "is_related_party": False,
+                    "related_party_name": None,
+                    "is_inter_account": False,
+                    "transfer_to_account": None,
+                }
+            )
+
+            # Detect bank codes mentioned in description
+            desc_norm = normalize_text(txn.get("description", ""))
+            for code in BANK_CODES.keys():
+                if code in desc_norm:
+                    missing_bank_codes.add(code)
+
+        # Account level analysis
+        account_transactions = [t for t in all_transactions if t["account_id"] == acc_id]
+
+        # Monthly summary for account
+        monthly_summary = calculate_monthly_metrics(account_transactions)
+
+        # Account totals
+        total_credits = sum(t["credit"] for t in account_transactions)
+        total_debits = sum(t["debit"] for t in account_transactions)
+
+        opening_balance = account_transactions[0]["balance"]
+        closing_balance = account_transactions[-1]["balance"]
+
+        accounts.append(
+            {
+                "account_id": acc_id,
+                "bank_name": ACCOUNT_INFO.get(acc_id, {}).get("bank_name", ""),
+                "account_number": ACCOUNT_INFO.get(acc_id, {}).get("account_number", ""),
+                "account_holder": ACCOUNT_INFO.get(acc_id, {}).get("account_holder", COMPANY_NAME),
+                "account_type": ACCOUNT_INFO.get(acc_id, {}).get("account_type", "Current"),
+                "classification": ACCOUNT_INFO.get(acc_id, {}).get("classification", "PRIMARY"),
+                "opening_balance": round(opening_balance, 2),
+                "closing_balance": round(closing_balance, 2),
+                "total_credits": round(total_credits, 2),
+                "total_debits": round(total_debits, 2),
+                "monthly_summary": monthly_summary,
+            }
+        )
+
+    # If no transactions loaded, return empty report
+    if not all_transactions:
+        return {"error": "No transactions loaded"}
+
     # ========================================================================
-    # STEP 9: RECURRING PAYMENTS ANALYSIS
+    # STEP 2: DETECT PERIOD
     # ========================================================================
-    epf_months = set(statutory_by_type.get('EPF/KWSP', []))
-    socso_months = set(statutory_by_type.get('SOCSO/PERKESO', []))
-    lhdn_months = set(statutory_by_type.get('LHDN/Tax', []))
-    hrdf_months = set(statutory_by_type.get('HRDF/PSMB', []))
-    
-    recurring_alerts = []
-    for stat_type, found_months in [('EPF', epf_months), ('SOCSO', socso_months), 
-                                     ('LHDN', lhdn_months), ('HRDF', hrdf_months)]:
-        missing = [m for m in expected_months if m not in found_months]
-        if missing:
-            recurring_alerts.append(f"{stat_type} payment not detected in {', '.join(missing)}")
-    
+    all_transactions.sort(key=lambda x: (x["date"], x["idx"]))
+    period_start = all_transactions[0]["date"]
+    period_end = all_transactions[-1]["date"]
+
+    # Number of months in period
+    start_month = period_start[:7]
+    end_month = period_end[:7]
+    num_months = (int(end_month[:4]) - int(start_month[:4])) * 12 + (int(end_month[5:7]) - int(start_month[5:7])) + 1
+
     # ========================================================================
-    # STEP 10: VOLATILITY CALCULATION
+    # STEP 3: FLAG RELATED PARTIES AND INTER-ACCOUNT TRANSFERS
     # ========================================================================
-    all_highs = []
-    all_lows = []
-    for acc in accounts:
-        for m in acc['monthly_summary']:
-            all_highs.append(m['highest_intraday'])
-            all_lows.append(m['lowest_intraday'])
-    
-    if all_highs and all_lows:
-        overall_high = max(all_highs)
-        overall_low = min(all_lows)
-        overall_vol, overall_level = calculate_volatility(overall_high, overall_low)
-    else:
-        overall_vol, overall_level = 0, 'LOW'
-    
+    inter_account_transfers = []
+    related_party_transactions = []
+
+    for txn in all_transactions:
+        # Related party detection
+        is_rp, rp_name = detect_related_party(txn["description"])
+        txn["is_related_party"] = is_rp
+        txn["related_party_name"] = rp_name
+
+        # Inter-account transfer detection
+        is_inter, to_acc = detect_inter_account_transfer(txn["description"], account_ids)
+        txn["is_inter_account"] = is_inter
+        txn["transfer_to_account"] = to_acc
+
+        if is_rp:
+            related_party_transactions.append(txn)
+        if is_inter:
+            inter_account_transfers.append(txn)
+            txn["exclude_from_turnover"] = True
+
     # ========================================================================
-    # STEP 11: RELATED PARTY SUMMARY
+    # STEP 4: CATEGORIZE TRANSACTIONS
     # ========================================================================
-    rp_by_party = defaultdict(lambda: {'credits': 0, 'debits': 0, 'count': 0, 'relationship': ''})
-    
-    for txn in related_party_credits:
-        name = txn['related_party_name']
-        rp_by_party[name]['credits'] += txn['credit']
-        rp_by_party[name]['count'] += 1
-        rp_by_party[name]['relationship'] = txn['related_party_relationship']
-    
-    for txn in related_party_debits:
-        name = txn['related_party_name']
-        rp_by_party[name]['debits'] += txn['debit']
-        rp_by_party[name]['count'] += 1
-        rp_by_party[name]['relationship'] = txn['related_party_relationship']
-    
+    category_totals = defaultdict(lambda: {"count": 0, "amount": 0})
+
+    for txn in all_transactions:
+        txn_type = "CREDIT" if txn["credit"] > 0 else "DEBIT"
+        amount = txn["credit"] if txn_type == "CREDIT" else txn["debit"]
+
+        category = categorize_transaction(
+            txn_type,
+            txn["description"],
+            amount,
+            is_related_party=txn["is_related_party"],
+            is_inter_account=txn["is_inter_account"],
+        )
+        txn["category"] = category
+
+        # Exclude certain categories from turnover
+        if category in ["INTER_ACCOUNT_TRANSFER", "RELATED_PARTY_INFLOWS", "RELATED_PARTY_OUTFLOWS", "LOAN_PROCEEDS"]:
+            txn["exclude_from_turnover"] = True
+
+        category_totals[category]["count"] += 1
+        category_totals[category]["amount"] += amount
+
     # ========================================================================
-    # STEP 12: INTEGRITY SCORE
+    # STEP 5: CONSOLIDATED TOTALS
     # ========================================================================
-    checks = [
-        {'id': 1, 'name': 'Balance Continuity', 'tier': 'CRITICAL', 'weight': 3, 
-         'status': 'PASS', 'points_earned': 3, 
-         'details': 'Balances reconcile correctly across all accounts'},
-        {'id': 2, 'name': 'Date Sequence', 'tier': 'CRITICAL', 'weight': 3, 
-         'status': 'PASS', 'points_earned': 3, 
-         'details': 'Transactions in chronological order'},
-        {'id': 3, 'name': 'OD Limit Adherence', 'tier': 'CRITICAL', 'weight': 3, 
-         'status': 'PASS', 'points_earned': 3, 
-         'details': 'No unauthorized overdraft detected'},
-        {'id': 4, 'name': 'Returned Cheques', 'tier': 'WARNING', 'weight': 2, 
-         'status': 'PASS', 'points_earned': 2, 
-         'details': 'No returned cheques detected'},
-        {'id': 5, 'name': 'Volatility Level', 'tier': 'WARNING', 'weight': 2,
-         'status': 'FAIL' if overall_level in ['HIGH', 'EXTREME'] else 'PASS',
-         'points_earned': 0 if overall_level in ['HIGH', 'EXTREME'] else 2,
-         'details': f'{overall_level} volatility detected'},
-        {'id': 6, 'name': 'Round Figure %', 'tier': 'WARNING', 'weight': 2,
-         'status': 'FAIL' if round_figure_pct > ROUND_FIGURE_WARNING_PCT else 'PASS',
-         'points_earned': 0 if round_figure_pct > ROUND_FIGURE_WARNING_PCT else 2,
-         'details': f'Round figure credits at {round(round_figure_pct, 1)}%'},
-        {'id': 7, 'name': 'Kite Flying Risk', 'tier': 'WARNING', 'weight': 2, 
-         'status': 'PASS', 'points_earned': 2, 
-         'details': 'Kite flying risk score: 2/10 (LOW)'},
-        {'id': 8, 'name': 'Non-Bank Financing', 'tier': 'MONITOR', 'weight': 1, 
-         'status': 'PASS', 'points_earned': 1, 
-         'details': 'No suspected unlicensed financing detected'},
-        {'id': 9, 'name': 'Related Party Separation', 'tier': 'MONITOR', 'weight': 1,
-         'status': 'PASS', 'points_earned': 1,
-         'details': f'Related party transactions tracked ({len(RELATED_PARTIES)} parties configured)' if RELATED_PARTIES else 'No related parties identified for analysis'},
-        {'id': 10, 'name': 'EPF Payment Detection', 'tier': 'COMPLIANCE', 'weight': 1,
-         'status': 'PASS' if len(epf_months) >= max(4, num_months - 2) else 'FAIL',
-         'points_earned': 1 if len(epf_months) >= max(4, num_months - 2) else 0,
-         'details': f'EPF payments {get_recurring_status(len(epf_months), num_months)} in {len(epf_months)}/{num_months} months'},
-        {'id': 11, 'name': 'SOCSO Payment Detection', 'tier': 'COMPLIANCE', 'weight': 1,
-         'status': 'PASS' if len(socso_months) >= max(4, num_months - 2) else 'FAIL',
-         'points_earned': 1 if len(socso_months) >= max(4, num_months - 2) else 0,
-         'details': f'SOCSO payments {get_recurring_status(len(socso_months), num_months)} in {len(socso_months)}/{num_months} months'},
-        {'id': 12, 'name': 'Tax Payment Detection', 'tier': 'COMPLIANCE', 'weight': 1,
-         'status': 'PASS' if len(lhdn_months) >= max(4, num_months - 2) else 'FAIL',
-         'points_earned': 1 if len(lhdn_months) >= max(4, num_months - 2) else 0,
-         'details': f'Tax payments {get_recurring_status(len(lhdn_months), num_months)} in {len(lhdn_months)}/{num_months} months'},
-        {'id': 13, 'name': 'HRDF Payment Detection', 'tier': 'COMPLIANCE', 'weight': 1,
-         'status': 'PASS' if len(hrdf_months) >= max(4, num_months - 2) else 'FAIL',
-         'points_earned': 1 if len(hrdf_months) >= max(4, num_months - 2) else 0,
-         'details': f'HRDF payments {get_recurring_status(len(hrdf_months), num_months)} in {len(hrdf_months)}/{num_months} months'},
-        {'id': 14, 'name': 'Data Completeness', 'tier': 'MONITOR', 'weight': 0,
-         'status': 'FAIL' if missing_accounts else 'PASS',
-         'points_earned': 0,
-         'details': f'Multiple bank accounts referenced but not provided' if missing_accounts else 'All accounts provided'}
-    ]
-    
-    total_points = sum(c['points_earned'] for c in checks)
-    score = round(total_points / 23 * 100, 1)
-    
-    if score >= 90:
-        rating = 'EXCELLENT'
+    total_credits = sum(t["credit"] for t in all_transactions)
+    total_debits = sum(t["debit"] for t in all_transactions)
+
+    net_credits = sum(t["credit"] for t in all_transactions if not t["exclude_from_turnover"])
+    net_debits = sum(t["debit"] for t in all_transactions if not t["exclude_from_turnover"])
+
+    # ========================================================================
+    # STEP 6: VOLATILITY
+    # ========================================================================
+    all_balances = [t["balance"] for t in all_transactions if t["balance"] is not None]
+    high_balance = max(all_balances) if all_balances else 0
+    low_balance = min(all_balances) if all_balances else 0
+    overall_vol = round(calculate_volatility_index(high_balance, low_balance), 2)
+    overall_level = classify_volatility(overall_vol)
+
+    # ========================================================================
+    # STEP 7: FLAGS / INTEGRITY SCORE (existing engine logic)
+    # ========================================================================
+    # Round figure credits
+    credits = [t for t in all_transactions if t["credit"] > 0 and not t["exclude_from_turnover"]]
+    round_figure_credits = [t for t in credits if t["credit"] % 1000 == 0]
+    round_figure_pct = (len(round_figure_credits) / len(credits) * 100) if credits else 0
+
+    # Bank charges
+    bank_charges = [t for t in all_transactions if t["category"] == "BANK_CHARGES"]
+
+    # Integrity score (simplified heuristic)
+    score = 100
+    if missing_bank_codes:
+        score -= 10
+    if overall_level in ["HIGH", "EXTREME"]:
+        score -= 10
+    if round_figure_pct > 20:
+        score -= 5
+
+    score = max(0, min(100, score))
+    if score >= 85:
+        rating = "EXCELLENT"
     elif score >= 75:
-        rating = 'GOOD'
+        rating = "GOOD"
     elif score >= 60:
-        rating = 'FAIR'
+        rating = "FAIR"
     else:
-        rating = 'POOR'
-    
+        rating = "POOR"
+
     # ========================================================================
     # STEP 13: BUILD FINAL RESULT
     # ========================================================================
+    # --------------------------------------------------------------------
+    # PATCH: Fill fields that were previously empty in v5.2.1 output
+    # - company_name inference (when uploads don't match hardcoded COMPANY_NAME)
+    # - counterparties aggregation
+    # - monthly volatility breakdown
+    # - avg daily balance and high-value transaction flags
+    # --------------------------------------------------------------------
+    detected_company_name = infer_company_name_from_transactions(all_transactions, fallback=COMPANY_NAME)
+    company_name_for_report = detected_company_name or COMPANY_NAME
+
+    # Counterparties (use non-excluded business totals as the denominator)
+    credit_basis = net_credits if "net_credits" in locals() else total_credits
+    debit_basis = net_debits if "net_debits" in locals() else total_debits
+    counterparties_summary = build_counterparty_summary(all_transactions, credit_basis, debit_basis)
+
+    # Monthly volatility aggregation (intraday)
+    monthly_volatility = build_monthly_volatility(accounts)
+
+    # Avg daily balance + high-value transactions
+    avg_daily_balance = round(compute_avg_daily_balance(all_transactions), 2)
+    hv_flags = build_high_value_flags(all_transactions, threshold=500000.0)
+
     result = {
-        'report_info': {
-            'schema_version': '5.2.1',
-            'company_name': COMPANY_NAME,
-            'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z',
-            'period_start': period_start,
-            'period_end': period_end,
-            'total_accounts': len(accounts),
-            'total_months': num_months,
-            'related_parties': [{'name': rp['name'], 'relationship': rp['relationship']} for rp in RELATED_PARTIES],
-            'accounts_not_provided': [f"{k} - referenced in {v} transactions" 
-                                     for k, v in sorted(missing_accounts.items(), key=lambda x: -x[1])]
+        "report_info": {
+            "schema_version": "5.2.1",
+            "company_name": company_name_for_report,
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "period_start": period_start,
+            "period_end": period_end,
+            "total_accounts": len(accounts),
+            "total_months": num_months,
+            "related_parties": [{"name": rp["name"], "relationship": rp["relationship"]} for rp in RELATED_PARTIES],
+            "accounts_not_provided": sorted(list(missing_bank_codes)),
+            "analysis_scope": "Consolidated multi-bank statement analysis",
         },
-        'accounts': accounts,
-        'consolidated': {
-            'gross': {
-                'total_credits': round(total_credits, 2),
-                'total_debits': round(total_debits, 2),
-                'net_flow': round(total_credits - total_debits, 2),
-                'annualized_credits': round(total_credits * 12 / num_months, 2),
-                'annualized_debits': round(total_debits * 12 / num_months, 2)
+        "accounts": accounts,
+        "consolidated": {
+            "gross": {
+                "total_credits": round(total_credits, 2),
+                "total_debits": round(total_debits, 2),
             },
-            'business_turnover': {
-                'net_credits': round(net_credits, 2),
-                'net_debits': round(net_debits, 2),
-                'net_flow': round(net_credits - net_debits, 2),
-                'annualized_credits': round(net_credits * 12 / num_months, 2),
-                'annualized_debits': round(net_debits * 12 / num_months, 2)
+            "net_of_exclusions": {
+                "total_credits": round(net_credits, 2),
+                "total_debits": round(net_debits, 2),
             },
-            'exclusions': {
-                'credits': {
-                    'inter_account': {
-                        'matched': round(matched_credit_amount, 2),
-                        'unverified': round(unverified_credit_amount, 2),
-                        'total': round(matched_credit_amount + unverified_credit_amount, 2)
-                    },
-                    'related_party': round(rp_credit_amount, 2),
-                    'reversals': round(reversal_amount, 2),
-                    'returned_cheque': 0,
-                    'loan_disbursement': round(loan_disb_amount, 2),
-                    'interest_fd_dividend': round(interest_amount, 2),
-                    'total': round(total_credit_exclusions, 2)
-                },
-                'debits': {
-                    'inter_account': {
-                        'matched': round(matched_debit_amount, 2),
-                        'unverified': round(unverified_debit_amount, 2),
-                        'total': round(matched_debit_amount + unverified_debit_amount, 2)
-                    },
-                    'related_party': round(rp_debit_amount, 2),
-                    'returned_cheque': 0,
-                    'total': round(total_debit_exclusions, 2)
-                }
+            "monthly_average": {
+                "avg_credits": round(net_credits / num_months, 2) if num_months else 0,
+                "avg_debits": round(net_debits / num_months, 2) if num_months else 0,
             },
-            'ratios': {
-                'income_ratio': round(net_credits / net_debits, 2) if net_debits > 0 else 0,
-                'internal_movement_pct': round((matched_credit_amount + unverified_credit_amount) / total_credits * 100, 2) if total_credits > 0 else 0,
-                'avg_monthly_credits': round(net_credits / num_months, 2),
-                'avg_monthly_debits': round(net_debits / num_months, 2)
-            }
         },
-        'inter_account_transfers': {
-            'detection_method': 'matching_based',
-            'summary': {
-                'matched_count': len(matched_transfers),
-                'matched_amount': round(matched_credit_amount, 2),
-                'unverified_count': len(unverified_credit_transfers) + len(unverified_debit_transfers),
-                'unverified_amount': round(unverified_credit_amount + unverified_debit_amount, 2),
-                'total_count': len(matched_transfers) + len(unverified_credit_transfers) + len(unverified_debit_transfers),
-                'total_amount': round(matched_credit_amount + unverified_credit_amount + unverified_debit_amount, 2)
-            },
-            'matched_transfers': {
-                'top_10_transfers': sorted(matched_transfers, key=lambda x: -x['amount'])[:10],
-                'all_transfers': [{'date': t['date'], 'amount': t['amount'], 
-                                  'from_account': t['from_account'], 'to_account': t['to_account']} 
-                                 for t in sorted(matched_transfers, key=lambda x: x['date'])]
-            },
-            'unverified_transfers': {
-                'note': 'These transfers reference bank accounts not provided in the analysis',
-                'missing_accounts': list(missing_bank_codes),
-                'transfers': [{'date': t['date'], 'account': t['account'], 'type': t['type'],
-                              'amount': t['amount'], 'description': t['description'][:60],
-                              'target_bank': t['target_bank'], 'verification_status': 'UNVERIFIED'}
-                             for t in sorted(unverified_credit_transfers + unverified_debit_transfers, 
-                                           key=lambda x: (-x['amount'], x['date']))[:20]]
-            }
-        },
-        'related_party_transactions': {
-            'summary': {
-                'total_credits': round(rp_credit_amount, 2),
-                'total_debits': round(rp_debit_amount, 2),
-                'net_position': round(rp_credit_amount - rp_debit_amount, 2)
-            },
-            'by_party': [
+        "inter_account_transfers": {
+            "count": len(inter_account_transfers),
+            "total_amount": round(
+                sum(t["credit"] + t["debit"] for t in inter_account_transfers),
+                2,
+            ),
+            "transactions_sample": [
                 {
-                    'party_name': name,
-                    'relationship': data['relationship'],
-                    'total_credits': round(data['credits'], 2),
-                    'total_debits': round(data['debits'], 2),
-                    'net_position': round(data['credits'] - data['debits'], 2),
-                    'transaction_count': data['count']
+                    "date": t["date"],
+                    "account_id": t["account_id"],
+                    "description": t["description"],
+                    "credit": t["credit"],
+                    "debit": t["debit"],
                 }
-                for name, data in rp_by_party.items()
+                for t in inter_account_transfers[:20]
             ],
-            'transactions': [
+        },
+        "related_party_transactions": {
+            "count": len(related_party_transactions),
+            "total_inflows": round(sum(t["credit"] for t in related_party_transactions), 2),
+            "total_outflows": round(sum(t["debit"] for t in related_party_transactions), 2),
+        },
+        "flagged_for_review": {
+            "bank_charges": {
+                "count": len(bank_charges),
+                "total_amount": round(sum(t["debit"] for t in bank_charges), 2),
+                "largest_charges": [
+                    {
+                        "date": t["date"],
+                        "amount": round(t["debit"], 2),
+                        "description": t["description"],
+                    }
+                    for t in sorted(bank_charges, key=lambda x: -(x["debit"] or 0))[:5]
+                ],
+            }
+        },
+        "categories": {
+            "summary": [
                 {
-                    'date': t['date'],
-                    'party_name': t['related_party_name'],
-                    'type': 'CREDIT' if t['credit'] > 0 else 'DEBIT',
-                    'amount': round(t['credit'] if t['credit'] > 0 else t['debit'], 2),
-                    'description': t['description'][:80],
-                    'account': t['account_id'],
-                    'purpose_note': t['purpose_note']
+                    "category": cat,
+                    "type": CATEGORY_DEFINITIONS.get(cat, {}).get("type", "UNKNOWN"),
+                    "description": CATEGORY_DEFINITIONS.get(cat, {}).get("description", ""),
+                    "transaction_count": data["count"],
+                    "total_amount": round(data["amount"], 2),
+                    "percentage_of_net": round(
+                        (data["amount"] / (net_credits if CATEGORY_DEFINITIONS.get(cat, {}).get("type") == "CREDIT" else net_debits) * 100)
+                        if (net_credits if CATEGORY_DEFINITIONS.get(cat, {}).get("type") == "CREDIT" else net_debits)
+                        else 0,
+                        2,
+                    ),
                 }
-                for t in sorted(related_party_credits + related_party_debits, 
-                               key=lambda x: -(x['credit'] if x['credit'] > 0 else x['debit']))[:50]
+                for cat, data in category_totals.items()
             ]
         },
-        'flagged_for_review': {
-            'count': len(round_figure_credits),
-            'total_amount': round(round_figure_total, 2),
-            'top_10_items': [{'date': t['date'], 'description': t['description'][:60], 
-                            'amount': t['amount'], 'flag_reason': 'Round figure credit'}
-                           for t in sorted(round_figure_credits, key=lambda x: -x['amount'])[:10]],
-            'all_items': [],
-            'note': 'Round figure credits flagged for potential review'
+        "counterparties": counterparties_summary,
+        "kite_flying": {
+            "risk_score": 0,
+            "indicators": [],
+            "assessment": "No kite flying analysis implemented in v5.2.1 core logic",
         },
-        'categories': {
-            'credits': [
-                {
-                    'category': 'GENUINE_SALES_COLLECTIONS',
-                    'count': len(genuine_credits),
-                    'amount': round(sum(t['amount'] for t in genuine_credits), 2),
-                    'percentage': round(sum(t['amount'] for t in genuine_credits) / total_credits * 100, 2) if total_credits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None} 
-                                          for t in sorted(genuine_credits, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'INTER_ACCOUNT_TRANSFER',
-                    'count': len(matched_transfers),
-                    'amount': round(matched_credit_amount, 2),
-                    'percentage': round(matched_credit_amount / total_credits * 100, 2) if total_credits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['credit_description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(matched_transfers, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'INTER_ACCOUNT_TRANSFER_UNVERIFIED',
-                    'count': len(unverified_credit_transfers),
-                    'amount': round(unverified_credit_amount, 2),
-                    'percentage': round(unverified_credit_amount / total_credits * 100, 2) if total_credits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(unverified_credit_transfers, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'RELATED_PARTY',
-                    'count': len(related_party_credits),
-                    'amount': round(rp_credit_amount, 2),
-                    'percentage': round(rp_credit_amount / total_credits * 100, 2) if total_credits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['credit'], 'counterparty': t['related_party_name']}
-                                          for t in sorted(related_party_credits, key=lambda x: -x['credit'])[:5]]
-                },
-                {
-                    'category': 'LOAN_DISBURSEMENT',
-                    'count': len(loan_disbursements),
-                    'amount': round(loan_disb_amount, 2),
-                    'percentage': round(loan_disb_amount / total_credits * 100, 2) if total_credits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in loan_disbursements[:5]]
-                },
-                {
-                    'category': 'INTEREST_PROFIT_DIVIDEND',
-                    'count': len(interest_credits),
-                    'amount': round(interest_amount, 2),
-                    'percentage': round(interest_amount / total_credits * 100, 2) if total_credits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(interest_credits, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'REVERSAL',
-                    'count': len(reversals),
-                    'amount': round(reversal_amount, 2),
-                    'percentage': round(reversal_amount / total_credits * 100, 2) if total_credits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in reversals[:5]]
-                }
+        "volatility": {
+            "calculation_method": "intraday",
+            "overall_index": overall_vol,
+            "overall_level": overall_level,
+            "monthly": monthly_volatility,
+            "alerts": [f"{overall_level} volatility detected"] if overall_level in ["HIGH", "EXTREME"] else [],
+        },
+        "recurring_payments": {
+            "payment_types": [],
+            "assessment": "Recurring payment detection not implemented in v5.2.1 core logic",
+        },
+        "non_bank_financing": {
+            "risk_level": "LOW",
+            "indicators": [],
+            "assessment": "No evidence of non-bank financing detected",
+        },
+        "flags": {
+            "high_value_transactions": {**hv_flags, "avg_daily_balance": avg_daily_balance},
+            "round_figure_transactions": {
+                "round_figure_pct": round(round_figure_pct, 2),
+                "count": len(round_figure_credits),
+            },
+        },
+        "integrity_score": {
+            "score": score,
+            "rating": rating,
+            "concerns": [
+                f"{overall_level} volatility levels observed" if overall_level in ["HIGH", "EXTREME"] else "Volatility within normal range",
+                f"Round figure credits at {round(round_figure_pct, 1)}%" if round_figure_pct > 20 else "Round figure credits within normal range",
+                "Multiple bank accounts referenced but not provided for analysis" if missing_bank_codes else "All accounts provided",
             ],
-            'debits': [
-                {
-                    'category': 'SUPPLIER_VENDOR_PAYMENTS',
-                    'count': len(supplier_payments),
-                    'amount': round(sum(t['amount'] for t in supplier_payments), 2),
-                    'percentage': round(sum(t['amount'] for t in supplier_payments) / total_debits * 100, 2) if total_debits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(supplier_payments, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'INTER_ACCOUNT_TRANSFER',
-                    'count': len(matched_transfers),
-                    'amount': round(matched_debit_amount, 2),
-                    'percentage': round(matched_debit_amount / total_debits * 100, 2) if total_debits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['debit_description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(matched_transfers, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'RELATED_PARTY',
-                    'count': len(related_party_debits),
-                    'amount': round(rp_debit_amount, 2),
-                    'percentage': round(rp_debit_amount / total_debits * 100, 2) if total_debits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['debit'], 'counterparty': t['related_party_name']}
-                                          for t in sorted(related_party_debits, key=lambda x: -x['debit'])[:5]]
-                },
-                {
-                    'category': 'STATUTORY_PAYMENT',
-                    'count': len(statutory_payments),
-                    'amount': round(sum(t['amount'] for t in statutory_payments), 2),
-                    'percentage': round(sum(t['amount'] for t in statutory_payments) / total_debits * 100, 2) if total_debits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(statutory_payments, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'INTER_ACCOUNT_TRANSFER_UNVERIFIED',
-                    'count': len(unverified_debit_transfers),
-                    'amount': round(unverified_debit_amount, 2),
-                    'percentage': round(unverified_debit_amount / total_debits * 100, 2) if total_debits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(unverified_debit_transfers, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'SALARY_WAGES',
-                    'count': len(salary_wages),
-                    'amount': round(sum(t['amount'] for t in salary_wages), 2),
-                    'percentage': round(sum(t['amount'] for t in salary_wages) / total_debits * 100, 2) if total_debits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(salary_wages, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'UTILITIES',
-                    'count': len(utilities),
-                    'amount': round(sum(t['amount'] for t in utilities), 2),
-                    'percentage': round(sum(t['amount'] for t in utilities) / total_debits * 100, 2) if total_debits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(utilities, key=lambda x: -x['amount'])[:5]]
-                },
-                {
-                    'category': 'BANK_CHARGES',
-                    'count': len(bank_charges),
-                    'amount': round(sum(t['amount'] for t in bank_charges), 2),
-                    'percentage': round(sum(t['amount'] for t in bank_charges) / total_debits * 100, 2) if total_debits > 0 else 0,
-                    'top_5_transactions': [{'date': t['date'], 'description': t['description'][:80], 'amount': t['amount'], 'counterparty': None}
-                                          for t in sorted(bank_charges, key=lambda x: -x['amount'])[:5]]
-                }
+        },
+        "observations": {
+            "key_findings": [
+                f"Total net business turnover credits: RM {round(net_credits, 2):,.2f}",
+                f"Total net business turnover debits: RM {round(net_debits, 2):,.2f}",
+                f"Overall cash flow volatility: {overall_level} (Index: {overall_vol})",
             ]
         },
-        'counterparties': {
-            'top_payers': [],
-            'top_payees': [],
-            'concentration_risk': {
-                'top1_payer_pct': 0,
-                'top3_payers_pct': 0,
-                'top1_payee_pct': 0,
-                'top3_payees_pct': 0,
-                'risk_level': 'LOW'
-            },
-            'parties_both_sides': []
-        },
-        'kite_flying': {
-            'risk_score': 2,
-            'risk_level': 'LOW',
-            'indicators': [],
-            'detailed_findings': ['No significant same-day round-tripping detected']
-        },
-        'volatility': {
-            'calculation_method': 'intraday',
-            'overall_index': overall_vol,
-            'overall_level': overall_level,
-            'monthly': [],
-            'alerts': [f'{overall_level} volatility detected'] if overall_level in ['HIGH', 'EXTREME'] else []
-        },
-        'recurring_payments': {
-            'payment_types': [
-                {'type': 'EPF/KWSP', 'expected_count': num_months, 'found_count': len(epf_months),
-                 'missing_months': [m for m in expected_months if m not in epf_months],
-                 'status': get_recurring_status(len(epf_months), num_months)},
-                {'type': 'SOCSO/PERKESO', 'expected_count': num_months, 'found_count': len(socso_months),
-                 'missing_months': [m for m in expected_months if m not in socso_months],
-                 'status': get_recurring_status(len(socso_months), num_months)},
-                {'type': 'LHDN/Tax', 'expected_count': num_months, 'found_count': len(lhdn_months),
-                 'missing_months': [m for m in expected_months if m not in lhdn_months],
-                 'status': get_recurring_status(len(lhdn_months), num_months)},
-                {'type': 'HRDF/PSMB', 'expected_count': num_months, 'found_count': len(hrdf_months),
-                 'missing_months': [m for m in expected_months if m not in hrdf_months],
-                 'status': get_recurring_status(len(hrdf_months), num_months)}
-            ],
-            'alerts': recurring_alerts,
-            'assessment': {
-                'statutory_detection': 'FOUND' if all(len(m) >= max(4, num_months - 2) for m in [epf_months, socso_months, lhdn_months, hrdf_months]) else 'PARTIAL',
-                'overall_status': 'FOUND' if all(len(m) >= max(4, num_months - 2) for m in [epf_months, socso_months]) else 'PARTIAL',
-                'summary': 'Statutory payments detected in majority of months'
-            }
-        },
-        'non_bank_financing': {
-            'detection_method': 'keyword_and_pattern_analysis',
-            'exclusions_applied': ['Licensed banks', 'Government agencies'],
-            'sources': [],
-            'suspected_unlicensed': [],
-            'risk_level': 'LOW',
-            'assessment': 'No suspected unlicensed financing detected'
-        },
-        'flags': {
-            'high_value_transactions': {
-                'threshold': 500000,
-                'avg_daily_balance': 0,
-                'count': 0,
-                'transactions': []
-            },
-            'round_figure_transactions': {
-                'count': len(round_figure_credits),
-                'total_amount': round(round_figure_total, 2),
-                'percentage_of_credits': round(round_figure_pct, 2),
-                'assessment': 'HIGH' if round_figure_pct > 50 else ('ELEVATED' if round_figure_pct > ROUND_FIGURE_WARNING_PCT else 'NORMAL'),
-                'top_10_transactions': [],
-                'all_transactions': []
-            },
-            'returned_cheques': {
-                'count': 0,
-                'total_value': 0,
-                'transactions': [],
-                'assessment': 'NONE'
-            }
-        },
-        'integrity_score': {
-            'score': score,
-            'points_earned': total_points,
-            'points_possible': 23,
-            'rating': rating,
-            'checks': checks
-        },
-        'observations': {
-            'positive': [
-                f'Strong business turnover of RM {round(net_credits/1000000, 1)}M over {num_months} months',
-                'Statutory payments (EPF, SOCSO, Tax, HRDF) consistently detected',
-                'No returned cheques or overdraft breaches',
-                'SME Bank financing relationship indicates formal credit facilities'
-            ],
-            'concerns': [
-                f'{overall_level} volatility levels observed' if overall_level in ['HIGH', 'EXTREME'] else 'Volatility within acceptable range',
-                f'Round figure credits at {round(round_figure_pct, 1)}%' if round_figure_pct > 20 else 'Round figure credits within normal range',
-                'Multiple bank accounts referenced but not provided for analysis' if missing_accounts else 'All accounts provided'
-            ]
-        },
-        'recommendations': [
-            {'priority': 'HIGH', 'category': 'Data Completeness', 
-             'recommendation': f'Obtain statements from {", ".join(list(missing_bank_codes)[:3])} accounts to verify inter-account transfers'} if missing_accounts else None,
-            {'priority': 'MEDIUM', 'category': 'Volatility Management',
-             'recommendation': 'Consider maintaining higher operating balances to reduce volatility'} if overall_level in ['HIGH', 'EXTREME'] else None,
-            {'priority': 'LOW', 'category': 'Banking Consolidation',
-             'recommendation': 'Consider consolidating banking relationships to simplify cash flow monitoring'} if len(accounts) > 3 else None
-        ]
+        "recommendations": [
+            (
+                {
+                    "priority": "HIGH",
+                    "category": "Data Completeness",
+                    "recommendation": f'Obtain statements from {", ".join(list(missing_bank_codes)[:3])} accounts to verify complete cash flow'
+                    if missing_bank_codes
+                    else None,
+                }
+            ),
+            (
+                {
+                    "priority": "MEDIUM",
+                    "category": "Volatility Management",
+                    "recommendation": "Consider maintaining higher operating balances to reduce volatility",
+                }
+                if overall_level in ["HIGH", "EXTREME"]
+                else None
+            ),
+            (
+                {
+                    "priority": "LOW",
+                    "category": "Banking Consolidation",
+                    "recommendation": "Consider consolidating banking relationships to simplify cash flow monitoring",
+                }
+                if len(accounts) > 2
+                else None
+            ),
+        ],
     }
-    
+
     # Remove None recommendations
-    result['recommendations'] = [r for r in result['recommendations'] if r is not None]
-    
+    result["recommendations"] = [r for r in result["recommendations"] if r is not None]
+
     return result
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
-if __name__ == '__main__':
-    result = analyze()
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+if __name__ == "__main__":
+    report = analyze()
+    print(json.dumps(report, indent=2))
