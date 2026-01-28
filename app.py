@@ -3,7 +3,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import streamlit as st
 
@@ -12,6 +12,10 @@ import streamlit as st
 # - Upload multiple JSON statements
 # - Detect/override company name accurately (tuned for your statement structure)
 # - Patch globals in bank_analysis_v5_2_1.py and call analyze()
+# - Post-process/enrich results to fill empty HTML categories:
+#     - counterparties.top_payers/top_payees
+#     - flags.round_figure_transactions.top_10_transactions/all_transactions
+#     - bank and counterparty fields for top transactions
 # - DOES NOT change core engine logic
 
 
@@ -24,6 +28,10 @@ class AccountConfig:
     classification: str
 
 
+# -------------------------
+# Basic utilities
+# -------------------------
+
 def _sanitize_company_name(name: str) -> str:
     name = (name or "").strip()
     name = re.sub(r"\s+", " ", name)
@@ -33,7 +41,6 @@ def _sanitize_company_name(name: str) -> str:
 def _generate_company_keywords(company_name: str) -> List[str]:
     """
     Generate robust partial-match keywords to reduce false negatives.
-    We keep it conservative: full name + 1-3 leading meaningful tokens + optional stem.
     """
     name = _sanitize_company_name(company_name).upper()
     if not name:
@@ -56,11 +63,9 @@ def _generate_company_keywords(company_name: str) -> List[str]:
         kws.append(" ".join(words[:2]))
     if len(words) >= 3:
         kws.append(" ".join(words[:3]))
-
     if words and len(words[0]) >= 8:
         kws.append(words[0][:8])
 
-    # Deduplicate, preserve order
     seen = set()
     out: List[str] = []
     for k in kws:
@@ -70,139 +75,6 @@ def _generate_company_keywords(company_name: str) -> List[str]:
             out.append(k2)
     return out
 
-
-# -------------------------
-# Company detection (tuned for your dataset)
-# -------------------------
-
-def _extract_candidate_company_names(statement_json: dict, filename: str = "") -> List[str]:
-    """
-    Robust extraction for your statement JSONs:
-      {summary, monthly_summary, transactions}
-    There is typically no explicit account-holder field, so we mine:
-      - filename hints (e.g., contains "MTC")
-      - transactions[].description patterns (including 'SDN.' without 'BHD')
-    """
-    candidates: List[str] = []
-
-    # 1) Filename hints (your files: "CIMB KL MTC.json", etc.)
-    fn = (filename or "").upper()
-    if "MTC" in fn:
-        candidates.append("MTC ENGINEERING SDN BHD")
-        candidates.append("MTC ENGINEERING")
-
-    txns = statement_json.get("transactions") or []
-    if not isinstance(txns, list):
-        return candidates
-
-    # 2) Patterns
-    # A) company legal-ish patterns (including SDN. without BHD)
-    pat_legal = re.compile(
-        r"([A-Z][A-Z0-9&.\- ]{2,80}\b(?:SDN\.?\s*BHD\.?|SDN\.?|BERHAD|BHD)\b)"
-    )
-    # B) fallback business-type patterns
-    pat_type = re.compile(
-        r"([A-Z][A-Z0-9&.\- ]{2,60}\b(?:ENGINEERING|HOLDINGS|TRADING|SOLUTIONS|CONSULT|ENTERPRISE)\b)"
-    )
-
-    for t in txns[:3000]:
-        if not isinstance(t, dict):
-            continue
-
-        desc = t.get("description")
-        if not isinstance(desc, str) or not desc.strip():
-            continue
-
-        u = desc.upper()
-
-        for m in pat_legal.finditer(u):
-            candidates.append(m.group(1).strip())
-
-        # If no legal marker, try a "type" match
-        if ("SDN" not in u) and ("BHD" not in u) and ("BERHAD" not in u):
-            for m in pat_type.finditer(u):
-                candidates.append(m.group(1).strip())
-
-        # Special boost: capture "MTC ... ENGINEERING ..." even if truncated
-        if "MTC" in u:
-            m = re.search(r"(MTC[ A-Z0-9&.\-]{0,30}ENGINEERING(?:[ A-Z0-9&.\-]{0,20})?)", u)
-            if m:
-                candidates.append(m.group(1).strip())
-
-    return candidates
-
-
-def _pick_best_company_name(candidates: List[str]) -> str:
-    """
-    Choose most plausible company name using frequency + scoring.
-    Strongly prefer 'MTC ENGINEERING' and penalize bank-like entities.
-    """
-    if not candidates:
-        return ""
-
-    # normalize & frequency
-    norm: List[str] = []
-    for c in candidates:
-        c = _sanitize_company_name(c).upper()
-        c = re.sub(r"\s+", " ", c).strip()
-        if c:
-            norm.append(c)
-
-    freq: Dict[str, int] = {}
-    for c in norm:
-        freq[c] = freq.get(c, 0) + 1
-
-    scored: List[Tuple[float, str]] = []
-    for c, f in freq.items():
-        score = 0.0
-
-        # Frequency across multiple statements matters
-        score += f * 2.0
-
-        # Boost target token(s)
-        if "MTC" in c:
-            score += 30
-        if "MTC ENGINEERING" in c:
-            score += 60
-
-        # Suffix bonus
-        if re.search(r"\bSDN\b", c):
-            score += 8
-        if re.search(r"\bBHD\b", c):
-            score += 6
-        if re.search(r"\bBERHAD\b", c):
-            score += 4
-
-        # Penalize obvious non-target entities (banks)
-        if "BANK" in c:
-            score -= 50
-        if "ISLAMIC" in c:
-            score -= 15
-
-        # Length sanity
-        ln = len(c)
-        if 8 <= ln <= 70:
-            score += 5
-        else:
-            score -= 5
-
-        scored.append((score, c))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best = scored[0][1]
-
-    # Standardize common short forms for your dataset
-    # If we got "MTC ENGINEERING SDN." normalize to "MTC ENGINEERING SDN BHD"
-    if "MTC ENGINEERING" in best and "SDN" in best and "BHD" not in best and "BERHAD" not in best:
-        best = best.replace("SDN.", "SDN").strip()
-        best = best + " BHD"
-
-    return _sanitize_company_name(best)
-
-
-# -------------------------
-# IO helpers
-# -------------------------
 
 def _safe_json_load(uploaded_file) -> dict:
     try:
@@ -224,6 +96,123 @@ def _import_engine():
     return importlib.import_module("bank_analysis_v5_2_1")
 
 
+# -------------------------
+# Company detection (tuned for your dataset)
+# -------------------------
+
+def _extract_candidate_company_names(statement_json: dict, filename: str = "") -> List[str]:
+    """
+    Robust extraction for your statement JSONs:
+      {summary, monthly_summary, transactions}
+    There is typically no explicit account-holder field, so we mine:
+      - filename hints (e.g., contains "MTC")
+      - transactions[].description patterns (including 'SDN.' without 'BHD')
+    """
+    candidates: List[str] = []
+
+    fn = (filename or "").upper()
+    if "MTC" in fn:
+        candidates.append("MTC ENGINEERING SDN BHD")
+        candidates.append("MTC ENGINEERING")
+
+    txns = statement_json.get("transactions") or []
+    if not isinstance(txns, list):
+        return candidates
+
+    pat_legal = re.compile(
+        r"([A-Z][A-Z0-9&.\- ]{2,80}\b(?:SDN\.?\s*BHD\.?|SDN\.?|BERHAD|BHD)\b)"
+    )
+    pat_type = re.compile(
+        r"([A-Z][A-Z0-9&.\- ]{2,60}\b(?:ENGINEERING|HOLDINGS|TRADING|SOLUTIONS|CONSULT|ENTERPRISE)\b)"
+    )
+
+    for t in txns[:3000]:
+        if not isinstance(t, dict):
+            continue
+        desc = t.get("description")
+        if not isinstance(desc, str) or not desc.strip():
+            continue
+
+        u = desc.upper()
+
+        for m in pat_legal.finditer(u):
+            candidates.append(m.group(1).strip())
+
+        if ("SDN" not in u) and ("BHD" not in u) and ("BERHAD" not in u):
+            for m in pat_type.finditer(u):
+                candidates.append(m.group(1).strip())
+
+        if "MTC" in u:
+            m = re.search(r"(MTC[ A-Z0-9&.\-]{0,30}ENGINEERING(?:[ A-Z0-9&.\-]{0,20})?)", u)
+            if m:
+                candidates.append(m.group(1).strip())
+
+    return candidates
+
+
+def _pick_best_company_name(candidates: List[str]) -> str:
+    """
+    Choose most plausible company name using frequency + scoring.
+    Strongly prefer 'MTC ENGINEERING' and penalize bank-like entities.
+    """
+    if not candidates:
+        return ""
+
+    norm: List[str] = []
+    for c in candidates:
+        c = _sanitize_company_name(c).upper()
+        c = re.sub(r"\s+", " ", c).strip()
+        if c:
+            norm.append(c)
+
+    freq: Dict[str, int] = {}
+    for c in norm:
+        freq[c] = freq.get(c, 0) + 1
+
+    scored: List[Tuple[float, str]] = []
+    for c, f in freq.items():
+        score = 0.0
+        score += f * 2.0
+
+        if "MTC" in c:
+            score += 30
+        if "MTC ENGINEERING" in c:
+            score += 60
+
+        if re.search(r"\bSDN\b", c):
+            score += 8
+        if re.search(r"\bBHD\b", c):
+            score += 6
+        if re.search(r"\bBERHAD\b", c):
+            score += 4
+
+        if "BANK" in c:
+            score -= 50
+        if "ISLAMIC" in c:
+            score -= 15
+
+        ln = len(c)
+        if 8 <= ln <= 70:
+            score += 5
+        else:
+            score -= 5
+
+        scored.append((score, c))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = scored[0][1]
+
+    if "MTC ENGINEERING" in best and "SDN" in best and "BHD" not in best and "BERHAD" not in best:
+        best = best.replace("SDN.", "SDN").strip()
+        best = best + " BHD"
+
+    return _sanitize_company_name(best)
+
+
+# -------------------------
+# Engine patching (minimal)
+# -------------------------
+
 def _patch_engine_config(
     engine,
     company_name: str,
@@ -240,18 +229,15 @@ def _patch_engine_config(
     company_name = _sanitize_company_name(company_name)
     company_keywords = _generate_company_keywords(company_name)
 
-    # FILE_PATHS placeholders now; will be overwritten with actual temp paths after write
     file_paths: Dict[str, str] = {}
     account_info: Dict[str, dict] = {}
 
     for fname, _payload, cfg in account_rows:
-        file_paths[cfg.account_id] = fname  # placeholder
-
-        # IMPORTANT: engine expects info['account_holder']
+        file_paths[cfg.account_id] = fname  # placeholder until temp files are written
         account_info[cfg.account_id] = {
             "account_number": cfg.account_number,
             "bank_name": cfg.bank_name,
-            "account_holder": company_name,  # <-- FIX for KeyError
+            "account_holder": company_name,  # REQUIRED by your engine (prevents KeyError)
             "account_type": cfg.account_type,
             "classification": cfg.classification,
             "description": f"{cfg.bank_name} ({cfg.classification})",
@@ -306,6 +292,249 @@ def _infer_account_number(payload: dict) -> Optional[str]:
 
 
 # -------------------------
+# Enrichment layer (fills empty HTML categories)
+# -------------------------
+
+ROUND_FIGURE_THRESHOLD = 10000
+
+
+def _is_round_figure(amount: float) -> bool:
+    try:
+        return float(amount) >= ROUND_FIGURE_THRESHOLD and float(amount) % 1000 == 0
+    except Exception:
+        return False
+
+
+def _normalize_party(s: str) -> str:
+    s = (s or "").upper()
+    s = re.sub(r"[^A-Z0-9& ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _looks_like_bank(name: str) -> bool:
+    u = _normalize_party(name)
+    if not u:
+        return False
+    bank_markers = [
+        "BANK", "ISLAMIC BANK", "BERHAD", "CIMB", "MAYBANK", "PUBLIC BANK", "RHB",
+        "HONG LEONG", "HLB", "MUAMALAT", "AFFIN", "AMBANK", "UOB", "HSBC", "OCBC"
+    ]
+    return any(m in u for m in bank_markers)
+
+
+def _extract_counterparty(description: str, company_keywords_upper: List[str]) -> Optional[str]:
+    """
+    Heuristic counterparty extraction from transaction description.
+    We keep it simple + robust for Malaysian bank narratives.
+    """
+    if not description:
+        return None
+
+    d = description.upper().strip()
+    d = re.sub(r"\s+", " ", d)
+
+    # Remove common noise prefixes
+    d = re.sub(r"^(TRANSFER|TRF|IBG|GIRO|RENTAS|DUITNOW|INSTANT|PAYMENT|PYMT|FT|FUND TRANSFER)\b[:\- ]*", "", d)
+    d = re.sub(r"\b(REF|REFERENCE|NO|NUM|ID)\b[:\- ]*[A-Z0-9\-\/]+", "", d)
+    d = re.sub(r"\b(AUTH|TRACE|TXN|TRANSACTION)\b[:\- ]*[A-Z0-9\-\/]+", "", d)
+    d = re.sub(r"\s+", " ", d).strip()
+
+    # Common patterns: "TO <NAME>", "FROM <NAME>"
+    m = re.search(r"\b(?:TO|FROM)\s+([A-Z0-9& ]{3,70})$", d)
+    if m:
+        cand = _normalize_party(m.group(1))
+        if cand and not any(k in cand for k in company_keywords_upper):
+            return cand.title()
+
+    # If description contains clear company-like phrase
+    m2 = re.search(r"\b([A-Z][A-Z0-9& ]{2,60}\b(?:SDN\.?\s*BHD|SDN\.?|BHD|BERHAD)\b)", d)
+    if m2:
+        cand = _normalize_party(m2.group(1))
+        if cand and not any(k in cand for k in company_keywords_upper):
+            return cand.title()
+
+    # Fallback: take first 2-4 tokens if they look like a name/vendor
+    tokens = [t for t in d.split() if len(t) >= 3]
+    if len(tokens) >= 2:
+        cand = _normalize_party(" ".join(tokens[:4]))
+        if cand and not any(k in cand for k in company_keywords_upper):
+            # avoid returning pure bank names as "counterparty"
+            if _looks_like_bank(cand):
+                return None
+            return cand.title()
+
+    return None
+
+
+def _collect_all_transactions(account_rows: List[Tuple[str, dict, AccountConfig]]) -> List[dict]:
+    """
+    Your uploaded JSON transactions already include:
+      date, description, debit, credit, balance, bank, source_file, ...
+    We also attach account_id/bank_name from UI config.
+    """
+    all_tx: List[dict] = []
+    for _fname, payload, cfg in account_rows:
+        txns = payload.get("transactions") or []
+        if not isinstance(txns, list):
+            continue
+        for t in txns:
+            if not isinstance(t, dict):
+                continue
+            debit = float(t.get("debit") or 0)
+            credit = float(t.get("credit") or 0)
+            if debit == 0 and credit == 0:
+                continue
+
+            bank_from_txn = t.get("bank")
+            bank_final = (bank_from_txn or cfg.bank_name or "").strip()
+
+            all_tx.append(
+                {
+                    "account_id": cfg.account_id,
+                    "account_label": cfg.bank_name,
+                    "bank": bank_final,
+                    "date": t.get("date"),
+                    "description": t.get("description", ""),
+                    "debit": debit,
+                    "credit": credit,
+                    "amount": credit if credit > 0 else debit,
+                    "type": "CREDIT" if credit > 0 else "DEBIT",
+                    "source_file": t.get("source_file"),
+                }
+            )
+    return all_tx
+
+
+def _enrich_results(
+    results: dict,
+    account_rows: List[Tuple[str, dict, AccountConfig]],
+    company_name: str,
+) -> dict:
+    """
+    Fill empty categories expected by HTML:
+      - counterparties top payers/payees
+      - round figure transactions lists
+      - inject counterparty + bank into category top transactions (best-effort match)
+    """
+    enriched = results  # mutate in place
+    company_keywords_upper = _generate_company_keywords(company_name)
+
+    all_tx = _collect_all_transactions(account_rows)
+
+    # Build a lookup for matching (date, amount, desc80) -> tx
+    lookup: Dict[Tuple[str, float, str], List[dict]] = {}
+    for t in all_tx:
+        key = (
+            str(t.get("date") or ""),
+            round(float(t.get("amount") or 0), 2),
+            (t.get("description") or "")[:80].upper(),
+        )
+        lookup.setdefault(key, []).append(t)
+
+    # 1) Round figure lists (credits only, same definition as engine)
+    round_fig = [t for t in all_tx if t["type"] == "CREDIT" and _is_round_figure(t["amount"])]
+    round_fig_sorted = sorted(round_fig, key=lambda x: float(x["amount"]), reverse=True)
+
+    rf_all = [
+        {
+            "date": t["date"],
+            "desc": (t["description"] or "")[:120],
+            "amount": round(float(t["amount"]), 2),
+            "type": t["type"],
+            "account": t.get("account_label") or t.get("account_id"),
+            "bank": t.get("bank") or "",
+            "counterparty": _extract_counterparty(t.get("description", ""), company_keywords_upper),
+        }
+        for t in round_fig_sorted
+    ]
+
+    flags = enriched.setdefault("flags", {})
+    rft = flags.setdefault("round_figure_transactions", {})
+    rft["top_10_transactions"] = rf_all[:10]
+    rft["all_transactions"] = rf_all
+
+    # 2) Counterparty aggregation (top payers/payees)
+    payers: Dict[str, Dict[str, Any]] = {}
+    payees: Dict[str, Dict[str, Any]] = {}
+
+    for t in all_tx:
+        cp = _extract_counterparty(t.get("description", ""), company_keywords_upper)
+        if not cp:
+            continue
+
+        bank = t.get("bank") or ""
+        amt = float(t["amount"])
+
+        if t["type"] == "CREDIT":
+            rec = payers.setdefault(cp, {"name": cp, "total": 0.0, "count": 0, "banks": {}})
+            rec["total"] += amt
+            rec["count"] += 1
+            rec["banks"][bank] = rec["banks"].get(bank, 0) + 1
+        else:
+            rec = payees.setdefault(cp, {"name": cp, "total": 0.0, "count": 0, "banks": {}})
+            rec["total"] += amt
+            rec["count"] += 1
+            rec["banks"][bank] = rec["banks"].get(bank, 0) + 1
+
+    def _top_list(d: Dict[str, Dict[str, Any]], n: int = 10) -> List[dict]:
+        items = list(d.values())
+        items.sort(key=lambda x: x["total"], reverse=True)
+        out = []
+        for it in items[:n]:
+            # flatten bank counts into "most_common_bank"
+            banks = it.get("banks", {})
+            most_common_bank = ""
+            if banks:
+                most_common_bank = sorted(banks.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+            out.append(
+                {
+                    "name": it["name"],
+                    "total_amount": round(it["total"], 2),
+                    "transaction_count": it["count"],
+                    "most_common_bank": most_common_bank,
+                }
+            )
+        return out
+
+    counterparties = enriched.setdefault("counterparties", {})
+    counterparties["top_payers"] = _top_list(payers, 10)
+    counterparties["top_payees"] = _top_list(payees, 10)
+
+    # 3) Inject bank + counterparty into categories top_5_transactions (best effort)
+    cats = enriched.get("categories", {})
+    for side in ["credits", "debits"]:
+        if side not in cats or not isinstance(cats[side], list):
+            continue
+        for bucket in cats[side]:
+            tx_list = bucket.get("top_5_transactions") or []
+            if not isinstance(tx_list, list):
+                continue
+            for row in tx_list:
+                try:
+                    k = (
+                        str(row.get("date") or ""),
+                        round(float(row.get("amount") or 0), 2),
+                        (row.get("description") or "")[:80].upper(),
+                    )
+                    candidates = lookup.get(k, [])
+                    if candidates:
+                        t = candidates[0]
+                        row["bank"] = t.get("bank") or ""
+                        row["account"] = t.get("account_label") or t.get("account_id")
+                        row["counterparty"] = _extract_counterparty(t.get("description", ""), company_keywords_upper)
+                    else:
+                        # fallback: at least attempt counterparty from the short desc
+                        row["counterparty"] = row.get("counterparty") or _extract_counterparty(
+                            row.get("description", ""), company_keywords_upper
+                        )
+                except Exception:
+                    continue
+
+    return enriched
+
+
+# -------------------------
 # Streamlit UI
 # -------------------------
 
@@ -339,7 +568,7 @@ def main():
     company_name = st.text_input(
         "Company name (edit to ensure it is correct)",
         value=detected_company or "",
-        help="We generate COMPANY_KEYWORDS from this. If auto-detect is wrong, overwrite here.",
+        help="If auto-detect is wrong, overwrite here. This affects core matching.",
     )
 
     if not company_name.strip():
@@ -366,9 +595,10 @@ def main():
                     key=f"accid_{idx}",
                 )
                 bank_name = st.text_input(
-                    f"Bank name ({fname})",
+                    f"Bank name label ({fname})",
                     value=_infer_bank_name(payload) or "",
                     key=f"bank_{idx}",
+                    help="Label for the account. Transaction-level bank is read from each txn['bank'] when available.",
                 )
             with col2:
                 account_number = st.text_input(
@@ -388,7 +618,6 @@ def main():
                     options=["operational", "cash_account", "inter_account", "credit_facility", "other"],
                     index=0,
                     key=f"class_{idx}",
-                    help="Keep consistent with your engine's expected classifications.",
                 )
 
             cfg = AccountConfig(
@@ -426,12 +655,14 @@ def main():
     except Exception as e:
         st.error("Core analysis failed.")
         st.exception(e)
-        st.info("If it still fails, the issue is inside the engine (schema expectations).")
         return
 
-    st.success("Analysis complete.")
+    # Enrich results so HTML sections stop being empty and bank detection is present
+    results = _enrich_results(results, account_rows, company_name)
 
-    st.subheader("Results")
+    st.success("Analysis complete (enriched with bank + counterparty details).")
+
+    st.subheader("Results (enriched)")
     st.json(results)
 
     st.subheader("Download output")
